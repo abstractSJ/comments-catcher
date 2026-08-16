@@ -220,6 +220,10 @@ jobs:
 
       - name: Run offline smoke validator when present
         run: |
+          # 前面的编译和 unittest 会在工作区生成缓存；Smoke validator 要求发布包保持干净。
+          find . -type d -name '__pycache__' -prune -exec rm -rf -- {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
           # 父任务可能稍后提供离线验证器。按约定路径依次查找，找到第一个后执行一次；
           # 验证器必须只使用本地 synthetic fixtures，不应连接 WebBridge 或外部网络。
           candidates=(
