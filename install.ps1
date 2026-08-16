@@ -40,6 +40,7 @@ function Assert-CanonicalSkillFolder {
 
     $requiredFiles = @(
         "SKILL.md",
+        "config.json",
         "agents/openai.yaml",
         "scripts/comments_catcher.py",
         "references/setup.md",

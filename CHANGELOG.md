@@ -12,6 +12,19 @@
 - 修复输出 Schema、技能说明、README 与 CI 样例之间的字段漂移。
 - 安装时排除 Python 缓存，避免把本地运行产物带入 skill 包。
 
+## [0.3.0] - 2026-08-17
+
+### Added
+
+- 技能目录新增 `config.json` 本地配置，可调 `delay`（请求基础间隔）、`jitter_range`（间隔随机抖动幅度）、`sub_rate`（二级线程抽样比例）与 `seed`（抽样种子），优先级为命令行参数 > config.json > 内置默认。
+- 新增 `--config` 指定自定义配置文件路径，新增 `--jitter-range` 命令行参数。
+- 采集开始时打印最终生效的节奏、抽样参数与配置来源。
+
+### Changed
+
+- `--delay`、`--sub-rate`、`--seed` 缺省时改为先读取 `config.json`，再回落到内置默认值。
+- 安装器与离线自检将 `config.json` 纳入必备文件清单。
+
 ## [0.2.0] - 2026-08-16
 
 ### Added

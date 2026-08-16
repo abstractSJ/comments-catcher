@@ -190,6 +190,101 @@ class IdentifierAndConfigTests(unittest.TestCase):
         self.assertIn("insert_ids=a+b", url)
 
 
+class ConfigFileTests(unittest.TestCase):
+    """config.json 本地配置加载、校验与参数优先级测试。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config_path = Path(self.temp.name) / "config.json"
+
+    def _write(self, payload: dict) -> Path:
+        self.config_path.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        return self.config_path
+
+    def test_load_config_file_ignores_comment_keys(self):
+        path = self._write(
+            {"_说明": "注释", "delay": 6, "jitter_range": 0.4, "sub_rate": 0.3, "seed": 7}
+        )
+        values = cc.load_config_file(path)
+        self.assertEqual(
+            values, {"delay": 6, "jitter_range": 0.4, "sub_rate": 0.3, "seed": 7}
+        )
+
+    def test_unknown_key_and_wrong_types_rejected(self):
+        with self.assertRaises(cc.ConfigError):
+            cc.load_config_file(self._write({"dealy": 5}))
+        with self.assertRaises(cc.ConfigError):
+            cc.load_config_file(self._write({"delay": "fast"}))
+        with self.assertRaises(cc.ConfigError):
+            cc.load_config_file(self._write({"seed": True}))
+        with self.assertRaises(cc.ConfigError):
+            cc.load_config_file(self._write({"seed": 4.5}))
+
+    def test_resolve_config_path_rules(self):
+        # 仓库自带的技能 config.json 存在时应作为默认配置被识别。
+        if cc.DEFAULT_CONFIG_PATH.is_file():
+            self.assertEqual(cc.resolve_config_path(None), cc.DEFAULT_CONFIG_PATH)
+        explicit = self._write({"delay": 8.0})
+        self.assertEqual(cc.resolve_config_path(str(explicit)), explicit.resolve())
+        with self.assertRaises(cc.ConfigError):
+            cc.resolve_config_path(str(Path(self.temp.name) / "missing.json"))
+
+    def test_config_file_values_applied_and_cli_overrides(self):
+        self._write({"delay": 9.0, "jitter_range": 0.2, "sub_rate": 0.25, "seed": 99})
+        args, config = cc.parse_and_validate_args(
+            ["--health-check", "--config", str(self.config_path)]
+        )
+        self.assertEqual(config.delay, 9.0)
+        self.assertEqual(config.jitter_range, 0.2)
+        self.assertEqual(args.sub_rate, 0.25)
+        self.assertEqual(args.seed, 99)
+        self.assertEqual(args.config_source, str(self.config_path.resolve()))
+
+        args, config = cc.parse_and_validate_args(
+            [
+                "--health-check",
+                "--config",
+                str(self.config_path),
+                "--delay",
+                "4.5",
+                "--sub-rate",
+                "0.8",
+            ]
+        )
+        self.assertEqual(config.delay, 4.5)
+        # 未被命令行覆盖的键仍然读取配置文件。
+        self.assertEqual(config.jitter_range, 0.2)
+        self.assertEqual(args.sub_rate, 0.8)
+        self.assertEqual(args.seed, 99)
+
+    def test_invalid_config_values_rejected_before_network(self):
+        for bad in ({"delay": 1.0}, {"jitter_range": 5.0}, {"sub_rate": 1.5}):
+            self._write(bad)
+            with self.assertRaises(cc.ConfigError):
+                cc.parse_and_validate_args(
+                    ["--health-check", "--config", str(self.config_path)]
+                )
+
+    def test_jitter_range_bounds(self):
+        with self.assertRaises(cc.ConfigError):
+            cc.CollectorConfig(jitter_range=-0.1).validate()
+        with self.assertRaises(cc.ConfigError):
+            cc.CollectorConfig(jitter_range=2.01).validate()
+        cc.CollectorConfig(jitter_range=0.0).validate()
+        cc.CollectorConfig(jitter_range=2.0).validate()
+
+    def test_rate_sleep_uses_jitter_range(self):
+        sleeps: list[float] = []
+        config = cc.CollectorConfig(delay=4.0, jitter_range=0.4)
+        cc.rate_sleep(config, sleeper=sleeps.append, random_fn=lambda: 1.0)
+        cc.rate_sleep(config, sleeper=sleeps.append, random_fn=lambda: 0.0)
+        self.assertAlmostEqual(sleeps[0], 4.0 * 1.2)
+        self.assertAlmostEqual(sleeps[1], 4.0 * 0.8)
+
+
 class RetryTests(unittest.TestCase):
     """有限重试与退避行为测试。"""
 

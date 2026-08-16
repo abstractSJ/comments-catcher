@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-COLLECTOR_VERSION = "0.2.0"
+COLLECTOR_VERSION = "0.3.0"
 SCHEMA_VERSION = "2.0.0"
 PLATFORM_AUTO = "auto"
 PLATFORM_DOUYIN = "douyin"
@@ -45,8 +45,16 @@ DEFAULT_SESSIONS = {
 }
 DEFAULT_DELAY = 5.0
 MIN_DELAY = 3.0
+DEFAULT_JITTER_RANGE = 0.6
+# 抖动总幅度的上限；超过 2.0 时最小间隔会低于 0，失去限速意义。
+MAX_JITTER_RANGE = 2.0
 DEFAULT_SUB_RATE = 0.5
 DEFAULT_SEED = 42
+
+# 技能目录（scripts/ 的上一级）下的 config.json 是默认本地配置文件；
+# 用 __file__ 定位而不是当前工作目录，保证从任意目录调用都读到同一份配置。
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = SKILL_ROOT / "config.json"
 
 EXIT_OK = 0
 EXIT_ARGUMENT = 2
@@ -125,7 +133,7 @@ class CollectorConfig:
     max_retry: int = 5
     retry_base_delay: float = 3.0
     delay: float = DEFAULT_DELAY
-    jitter_range: float = 0.6
+    jitter_range: float = DEFAULT_JITTER_RANGE
     page_size: int = 20
     captcha_wait_seconds: int = 180
     include_user_identifiers: bool = False
@@ -143,6 +151,10 @@ class CollectorConfig:
             raise ConfigError("WebBridge session 不能为空")
         if not math.isfinite(self.delay) or self.delay < MIN_DELAY:
             raise ConfigError(f"请求间隔必须是有限数且不小于 {MIN_DELAY:.1f} 秒")
+        if not math.isfinite(self.jitter_range) or not 0.0 <= self.jitter_range <= MAX_JITTER_RANGE:
+            raise ConfigError(
+                f"jitter_range 必须是 0.0 到 {MAX_JITTER_RANGE:.1f} 之间的有限数"
+            )
         if self.max_retry < 1:
             raise ConfigError("max_retry 必须至少为 1")
         if self.page_size < 1 or self.page_size > 50:
@@ -683,6 +695,77 @@ def validate_sub_rate(value: float) -> float:
     if not math.isfinite(value) or not 0.0 <= value <= 1.0:
         raise ConfigError("--sub-rate 必须是 0.0 到 1.0 之间的有限数")
     return value
+
+
+# config.json 中允许的用户可调键；未知键直接报错，避免拼写错误的配置被静默忽略。
+CONFIG_FILE_KEYS = {
+    "delay": "请求基础间隔秒数",
+    "jitter_range": "间隔随机抖动总幅度",
+    "sub_rate": "二级回复线程抽样比例",
+    "seed": "确定性抽样种子",
+}
+
+
+def load_config_file(path: Path) -> dict[str, Any]:
+    """
+    读取技能本地 config.json，只接受白名单内的数值键。
+
+    配置文件用于长期调控采集节奏与抽样参数；任何解析或类型错误都必须在产生
+    网络请求之前暴露，因此这里直接抛出 ConfigError 而不是回退默认值。
+
+    参数：
+        path: config.json 的路径，调用方需先确认文件存在。
+    返回：
+        键为白名单参数名、值为 int/float 的字典；以 "_" 开头的注释键会被忽略。
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"无法读取配置文件 {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError(f"配置文件 {path} 的顶层必须是 JSON 对象")
+
+    values: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key.startswith("_"):
+            continue
+        if key not in CONFIG_FILE_KEYS:
+            allowed = ", ".join(sorted(CONFIG_FILE_KEYS))
+            raise ConfigError(f"配置文件包含不支持的键 {key!r}；允许的键：{allowed}")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(f"配置项 {key} 必须是数值，当前为 {value!r}")
+        if key == "seed":
+            if isinstance(value, float) and not value.is_integer():
+                raise ConfigError("配置项 seed 必须是整数")
+            value = int(value)
+        values[key] = value
+    return values
+
+
+def resolve_config_path(explicit: str | None) -> Path | None:
+    """
+    确定本次运行的配置文件路径。
+
+    ``--config`` 显式指定的文件必须存在；未指定时回落到技能目录的默认
+    config.json，两者都没有则返回 None，表示全部使用内置默认值。
+    """
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.is_file():
+            raise ConfigError(f"--config 指定的配置文件不存在: {path}")
+        return path
+    if DEFAULT_CONFIG_PATH.is_file():
+        return DEFAULT_CONFIG_PATH
+    return None
+
+
+def _resolve_option(cli_value, file_values: dict[str, Any], key: str, default):
+    """按“命令行参数 > config.json > 内置默认”的优先级解析单个参数。"""
+    if cli_value is not None:
+        return cli_value
+    if key in file_values:
+        return file_values[key]
+    return default
 
 
 def validate_output_path(path: Path) -> None:
@@ -1253,10 +1336,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--csv", help="可选 CSV 输出路径")
     parser.add_argument("--with-sub", action="store_true", help="采集抽样命中的二级回复线程")
     parser.add_argument("--subs-only", action="store_true", help="复用已有一级评论，只补采二级回复")
-    parser.add_argument("--sub-rate", type=float, default=DEFAULT_SUB_RATE, help="二级线程抽样比例，默认 0.5")
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="确定性抽样种子，默认 42")
+    parser.add_argument(
+        "--sub-rate",
+        type=float,
+        default=None,
+        help="二级线程抽样比例 0–1；缺省读 config.json，内置默认 0.5",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="确定性抽样种子；缺省读 config.json，内置默认 42",
+    )
     parser.add_argument("--max-pages", type=int, help="本次最多新增采集的一级评论页数")
-    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="请求基础间隔秒数，默认 5.0，最低 3.0")
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=None,
+        help="请求基础间隔秒数，最低 3.0；缺省读 config.json，内置默认 5.0",
+    )
+    parser.add_argument(
+        "--jitter-range",
+        type=float,
+        default=None,
+        help="间隔随机抖动总幅度，0.6 表示 ±30%%；缺省读 config.json，内置默认 0.6",
+    )
+    parser.add_argument(
+        "--config",
+        help="自定义 config.json 路径；缺省自动读取技能目录下的 config.json（存在时）",
+    )
     parser.add_argument(
         "--daemon-url",
         default=os.getenv("COMMENTS_CATCHER_DAEMON_URL", DEFAULT_DAEMON_URL),
@@ -1288,10 +1396,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_and_validate_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, CollectorConfig]:
-    """解析参数并完成所有不依赖网络的验证。"""
+    """解析参数并按“命令行 > config.json > 内置默认”合成配置；全部验证不依赖网络。"""
     parser = build_parser()
     args = parser.parse_args(argv)
-    validate_sub_rate(args.sub_rate)
     if args.max_pages is not None and args.max_pages <= 0:
         raise ConfigError("--max-pages 必须大于 0")
     if args.subs_only:
@@ -1305,11 +1412,25 @@ def parse_and_validate_args(argv: list[str] | None = None) -> tuple[argparse.Nam
     session = args.session or os.getenv("COMMENTS_CATCHER_SESSION") or DEFAULT_SESSIONS[args.platform]
     args.session = session
 
+    # 先合成节奏与抽样参数再验证，保证配置文件里的非法值与命令行非法值一样
+    # 在发起任何网络请求之前被拒绝。
+    config_path = resolve_config_path(args.config)
+    file_values = load_config_file(config_path) if config_path else {}
+    args.config_source = str(config_path) if config_path else None
+    args.sub_rate = float(_resolve_option(args.sub_rate, file_values, "sub_rate", DEFAULT_SUB_RATE))
+    args.seed = int(_resolve_option(args.seed, file_values, "seed", DEFAULT_SEED))
+    args.delay = float(_resolve_option(args.delay, file_values, "delay", DEFAULT_DELAY))
+    args.jitter_range = float(
+        _resolve_option(args.jitter_range, file_values, "jitter_range", DEFAULT_JITTER_RANGE)
+    )
+    validate_sub_rate(args.sub_rate)
+
     config = CollectorConfig(
         platform=args.platform,
         daemon_url=args.daemon_url,
         session=session,
         delay=args.delay,
+        jitter_range=args.jitter_range,
         include_user_identifiers=args.include_user_identifiers,
     )
     config.validate()
@@ -1373,6 +1494,15 @@ def run(argv: list[str] | None = None) -> int:
 
     if args.subs_only and not state.get("comments"):
         raise ConfigError("--subs-only 需要已有输出文件包含一级评论")
+
+    # 采集开始前打印最终生效的节奏与抽样参数，便于确认命令行/配置文件的合成结果。
+    source_note = f"，配置来源 {args.config_source}" if args.config_source else "，未使用配置文件"
+    print(
+        f"[运行参数] 基础间隔={config.delay:.1f}s，抖动幅度={config.jitter_range:.2f}"
+        f"（±{config.jitter_range / 2:.0%}），抽样率={args.sub_rate:.2f}，"
+        f"种子={args.seed}{source_note}",
+        flush=True,
+    )
 
     collector = CommentsCollector(bridge, config, output_path, state)
     if not args.subs_only:

@@ -18,6 +18,7 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 COLLECTOR = SKILL_DIR / "scripts" / "comments_catcher.py"
 REQUIRED_SKILL_FILES = [
     SKILL_DIR / "SKILL.md",
+    SKILL_DIR / "config.json",
     SKILL_DIR / "agents" / "openai.yaml",
     COLLECTOR,
     SKILL_DIR / "references" / "setup.md",
@@ -114,6 +115,16 @@ def offline_check() -> dict:
         raise RuntimeError("skill 包含 Python 缓存目录：" + ", ".join(map(str, cache_dirs)))
     schema = validate_json_file(SKILL_DIR / "references" / "output-schema-v2.json")
     module = load_collector()
+    # config.json 是发布包的一部分，其取值必须与采集器校验规则保持一致。
+    config_values = module.load_config_file(SKILL_DIR / "config.json")
+    probe = module.CollectorConfig(
+        delay=float(config_values.get("delay", module.DEFAULT_DELAY)),
+        jitter_range=float(config_values.get("jitter_range", module.DEFAULT_JITTER_RANGE)),
+    )
+    probe.validate()
+    module.validate_sub_rate(float(config_values.get("sub_rate", module.DEFAULT_SUB_RATE)))
+    if not isinstance(config_values.get("seed", module.DEFAULT_SEED), int):
+        raise RuntimeError("config.json 的 seed 必须是整数")
     version_output = run_command([sys.executable, str(COLLECTOR), "--version"])
     run_command([sys.executable, str(COLLECTOR), "--help"])
 

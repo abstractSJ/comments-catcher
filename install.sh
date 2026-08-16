@@ -95,6 +95,7 @@ validate_skill_folder() {
     local relative_path
     local required_files=(
         "SKILL.md"
+        "config.json"
         "agents/openai.yaml"
         "scripts/comments_catcher.py"
         "references/setup.md"
