@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:comments-catcher:output-schema:v2",
+  "title": "Comments Catcher Output Schema v2",
+  "description": "comments-catcher 0.2.x 的双平台结构化评论与恢复状态输出。",
+  "type": "object",
+  "required": ["meta", "comments"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "collector_version",
+        "platform",
+        "video_id",
+        "all_count",
+        "fetched_count",
+        "sub_count",
+        "total_count",
+        "last_cursor",
+        "last_has_more",
+        "main_complete",
+        "main_page_count",
+        "sub_rate",
+        "seed",
+        "with_sub",
+        "sampled_cids",
+        "skipped_cids",
+        "sub_done_cids",
+        "updated_at"
+      ],
+      "properties": {
+        "schema_version": {"const": "2.0.0"},
+        "collector_version": {"type": "string", "minLength": 1},
+        "platform": {"enum": ["douyin", "bilibili"]},
+        "video_id": {"type": "string", "minLength": 1},
+        "aweme_id": {"type": "string", "minLength": 1},
+        "bvid": {"type": "string", "minLength": 1},
+        "oid": {"type": "integer", "minimum": 1},
+        "all_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "平台接口报告的评论总数；平台可能将一级评论和回复合计。"
+        },
+        "fetched_count": {"type": "integer", "minimum": 0},
+        "sub_count": {"type": "integer", "minimum": 0},
+        "total_count": {"type": "integer", "minimum": 0},
+        "last_cursor": {"type": ["integer", "string", "null"]},
+        "last_has_more": {"type": "integer", "enum": [0, 1]},
+        "main_complete": {"type": "boolean"},
+        "main_page_count": {"type": "integer", "minimum": 0},
+        "sub_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "seed": {"type": "integer"},
+        "with_sub": {"type": "boolean"},
+        "sampled_cids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "skipped_cids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "sub_done_cids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "updated_at": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    },
+    "comments": {
+      "type": "array",
+      "description": "规范化的一级评论数组。",
+      "items": {"$ref": "#/$defs/comment"}
+    },
+    "subs": {
+      "type": "array",
+      "description": "可选的回复线程；每项为 [root_cid, comments_array]。",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {"type": "string", "minLength": 1},
+          {"type": "array", "items": {"$ref": "#/$defs/comment"}}
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "comment": {
+      "type": "object",
+      "required": ["cid", "text"],
+      "properties": {
+        "cid": {"type": "string", "minLength": 1},
+        "text": {"type": "string"},
+        "create_time": {"type": ["integer", "string", "null"]},
+        "digg_count": {"type": "integer", "minimum": 0},
+        "reply_comment_total": {"type": "integer", "minimum": 0},
+        "nickname": {"type": ["string", "null"]},
+        "uid": {"type": ["string", "null"]},
+        "ip_label": {"type": ["string", "null"]},
+        "level": {"type": "integer", "minimum": 0},
+        "is_hot": {"type": "integer", "minimum": 0},
+        "reply_id": {"type": ["string", "null"]},
+        "root_comment_id": {"type": ["string", "null"]},
+        "is_author_digged": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    }
+  }
+}

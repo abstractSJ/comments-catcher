@@ -1,0 +1,244 @@
+name: CI
+
+# push、pull_request 与手工触发使用同一组确定性检查，避免发布包和日常分支采用不同标准。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# 验证任务只需读取仓库内容；显式收窄默认令牌权限可以降低工作流供应链风险。
+permissions:
+  contents: read
+
+concurrency:
+  # 同一引用只保留最新运行，减少快速连续推送造成的重复资源占用。
+  group: comments-catcher-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate repository package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install schema validator
+        run: |
+          # 只安装 JSON Schema 元模式检查所需的固定主版本，不安装采集器运行时依赖。
+          python -m pip install --disable-pip-version-check "jsonschema>=4.23,<5"
+
+      - name: Compile Python scripts
+        run: |
+          # 逐个编译仓库中的 Python 文件；compile_file 返回 false 时让 CI 立即失败。
+          # 排除虚拟环境和缓存目录，避免把依赖包或上一次运行产物误当成仓库源码。
+          python - <<'PY'
+          from __future__ import annotations
+
+          import compileall
+          import sys
+          from pathlib import Path
+
+          repository = Path.cwd()
+          excluded_parts = {".git", ".venv", "venv", "__pycache__"}
+          python_files = sorted(
+              path
+              for path in repository.rglob("*.py")
+              if not excluded_parts.intersection(path.parts)
+          )
+
+          failures: list[Path] = []
+          for path in python_files:
+              # force=True 确保 CI 检查当前源码，而不是复用可能存在的旧字节码时间戳。
+              if not compileall.compile_file(str(path), quiet=1, force=True):
+                  failures.append(path)
+
+          if failures:
+              for path in failures:
+                  print(f"编译失败：{path}", file=sys.stderr)
+              raise SystemExit(1)
+
+          print(f"已编译 {len(python_files)} 个 Python 文件。")
+          PY
+
+      - name: Run unittest discovery
+        run: |
+          # 始终执行 unittest discover。优先以 tests/ 为发现根目录，使其无需 __init__.py
+          # 也能被标准库发现；脚手架尚无 tests/ 时回退到仓库根目录。
+          start_directory="."
+          if [ -d "tests" ]; then
+            start_directory="tests"
+          fi
+
+          set +e
+          python -m unittest discover -s "$start_directory" -p "test*.py"
+          status=$?
+          set -e
+
+          if [ "$status" -eq 5 ]; then
+            printf '当前尚无可发现测试；已完成 unittest discover。\n'
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+
+      - name: Validate manifests, skill metadata, and output schema
+        run: |
+          # 使用标准库解析清单，再用 jsonschema 检查 v2 Schema 自身及代表性样例。
+          # 额外检查 SKILL.md frontmatter，避免技能描述文件因字段缺失而无法被加载。
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          from pathlib import Path
+
+          from jsonschema import Draft202012Validator
+
+          root = Path.cwd()
+
+          def load_json(relative_path: str) -> dict:
+              """读取并返回一个必须为 JSON 对象的仓库文件。"""
+              path = root / relative_path
+              with path.open("r", encoding="utf-8") as handle:
+                  value = json.load(handle)
+              if not isinstance(value, dict):
+                  raise AssertionError(f"{relative_path} 顶层必须是 JSON 对象")
+              return value
+
+          plugin = load_json(".claude-plugin/plugin.json")
+          assert plugin.get("name") == "comments-catcher"
+          assert plugin.get("version") == "0.2.0"
+          assert plugin.get("license") == "MIT"
+          assert plugin.get("skills") == "./skills/"
+
+          codex_plugin = load_json(".codex-plugin/plugin.json")
+          assert codex_plugin.get("name") == "comments-catcher"
+          assert codex_plugin.get("version") == "0.2.0"
+          assert codex_plugin.get("license") == "MIT"
+          assert codex_plugin.get("skills") == "./skills/"
+
+          marketplace = load_json(".claude-plugin/marketplace.json")
+          assert marketplace.get("name") == "comments-catcher"
+          assert marketplace.get("metadata", {}).get("version") == "0.2.0"
+          plugins = marketplace.get("plugins")
+          assert isinstance(plugins, list) and len(plugins) == 1
+          entry = plugins[0]
+          assert entry.get("name") == "comments-catcher"
+          assert entry.get("version") == "0.2.0"
+          assert entry.get("license") == "MIT"
+          assert entry.get("source") == "./"
+
+          schema = load_json(
+              "skills/comments-catcher/references/output-schema-v2.json"
+          )
+          Draft202012Validator.check_schema(schema)
+
+          # 代表性样例覆盖所有必需 meta 字段和 subs 的二元数组形态。
+          sample = {
+              "meta": {
+              "schema_version": "2.0.0",
+              "collector_version": "0.2.0",
+              "platform": "douyin",
+              "video_id": "0000000000000000000",
+              "aweme_id": "0000000000000000000",
+              "all_count": 1,
+              "fetched_count": 1,
+              "sub_count": 1,
+              "total_count": 2,
+              "last_cursor": None,
+              "last_has_more": 0,
+              "main_complete": True,
+              "main_page_count": 1,
+              "sub_rate": 0.5,
+              "seed": 42,
+              "with_sub": True,
+              "sampled_cids": ["root-1"],
+              "skipped_cids": [],
+              "sub_done_cids": ["root-1"],
+              "updated_at": "2026-01-01T00:00:00Z",
+              },
+              "comments": [{"cid": "root-1", "text": "公开评论"}],
+              "subs": [["root-1", [{"cid": "sub-1", "text": "公开回复"}]]],
+          }
+          Draft202012Validator(schema).validate(sample)
+
+          skill_text = (
+              root / "skills/comments-catcher/SKILL.md"
+          ).read_text(encoding="utf-8")
+          if not skill_text.startswith("---\n"):
+              raise AssertionError("SKILL.md 必须以 YAML frontmatter 开始")
+          try:
+              _, frontmatter, _ = skill_text.split("---", 2)
+          except ValueError as exc:
+              raise AssertionError("SKILL.md frontmatter 未正确闭合") from exc
+
+          required_patterns = {
+              "name": r"(?m)^name:\s*comments-catcher\s*$",
+              "description": r"(?m)^description:\s*\S.+$",
+          }
+          for field, pattern in required_patterns.items():
+              if re.search(pattern, frontmatter) is None:
+                  raise AssertionError(f"SKILL.md 缺少或错误：{field}")
+
+          interface_text = (
+              root / "skills/comments-catcher/agents/openai.yaml"
+          ).read_text(encoding="utf-8")
+          for required in ("display_name:", "short_description:", "default_prompt:", "$comments-catcher"):
+              if required not in interface_text:
+                  raise AssertionError(f"openai.yaml 缺少：{required}")
+
+          print("两个插件清单、技能 frontmatter、Codex UI 元数据与输出 Schema 校验通过。")
+          PY
+
+      - name: Check installer syntax
+        run: |
+          # bash -n 只做语法解析，不执行安装或复制文件。
+          bash -n ./install.sh
+
+          # PowerShell Parser 同样只解析抽象语法树；若发现语法错误则返回非零状态。
+          pwsh -NoProfile -Command '
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path "./install.ps1").Path,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              exit 1
+            }
+          '
+
+      - name: Run offline smoke validator when present
+        run: |
+          # 父任务可能稍后提供离线验证器。按约定路径依次查找，找到第一个后执行一次；
+          # 验证器必须只使用本地 synthetic fixtures，不应连接 WebBridge 或外部网络。
+          candidates=(
+            "skills/comments-catcher/scripts/smoke_validate.py"
+            "skills/comments-catcher/scripts/offline_smoke_validator.py"
+            "scripts/offline_smoke_validator.py"
+            "tests/offline_smoke_validator.py"
+          )
+
+          validator=""
+          for candidate in "${candidates[@]}"; do
+            if [ -f "$candidate" ]; then
+              validator="$candidate"
+              break
+            fi
+          done
+
+          if [ -n "$validator" ]; then
+            python "$validator"
+          else
+            printf '未找到离线 smoke validator；脚手架阶段跳过。\n'
+          fi

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "comments-catcher",
+  "owner": {
+    "name": "CURRENT_GITHUB_OWNER"
+  },
+  "metadata": {
+    "description": "Official marketplace manifest for the comments-catcher Claude Code plugin.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "comments-catcher",
+      "source": "./",
+      "description": "Collect public Douyin or Bilibili comments through an existing authenticated WebBridge browser session.",
+      "version": "0.2.0",
+      "repository": "https://github.com/CURRENT_GITHUB_OWNER/comments-catcher",
+      "license": "MIT",
+      "keywords": [
+        "comments",
+        "douyin",
+        "bilibili",
+        "webbridge",
+        "data-export"
+      ]
+    }
+  ]
+}

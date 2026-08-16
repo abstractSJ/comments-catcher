@@ -1,0 +1,52 @@
+# Python 解释器缓存与编译产物。
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 本地虚拟环境和依赖工具生成目录。
+.venv/
+venv/
+env/
+ENV/
+
+# 本地配置与认证材料；示例配置可单独显式提交。
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 编辑器与操作系统临时文件。
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# 评论采集输出和临时状态，防止公开数据或个人信息被意外提交。
+outputs/
+output/
+data/
+*.comments.json
+comments-*.json
+*.partial.json
+*.checkpoint.json
+
+# WebBridge 或浏览器自动化产生的本地运行状态与调试快照。
+.webbridge/
+playwright-report/
+test-results/
+
+# 构建与打包产物。
+build/
+dist/
+*.egg-info/
+*.zip

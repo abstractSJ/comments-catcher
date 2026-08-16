@@ -1,0 +1,7 @@
+interface:
+  display_name: "Comments Catcher"
+  short_description: "Collect public Douyin or Bilibili comments with WebBridge"
+  default_prompt: "Use $comments-catcher to open this Douyin or Bilibili video through WebBridge, collect its public comments, and save validated JSON."
+
+policy:
+  allow_implicit_invocation: true

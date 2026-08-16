@@ -1,0 +1,38 @@
+{
+  "code": 0,
+  "comments": [
+    {
+      "cid": "7000000000000000002",
+      "text": "合成一级评论 B（分页重复）",
+      "create_time": 1700000002,
+      "digg_count": 5,
+      "reply_comment_total": 0,
+      "nickname": "合成用户乙",
+      "uid": null,
+      "ip_label": null,
+      "level": 1,
+      "is_hot": 0,
+      "reply_id": null,
+      "root_comment_id": null,
+      "is_author_digged": 0
+    },
+    {
+      "cid": "7000000000000000003",
+      "text": "合成一级评论 C",
+      "create_time": 1700000003,
+      "digg_count": 1,
+      "reply_comment_total": 0,
+      "nickname": "合成用户丙",
+      "uid": null,
+      "ip_label": null,
+      "level": 1,
+      "is_hot": 0,
+      "reply_id": null,
+      "root_comment_id": null,
+      "is_author_digged": 0
+    }
+  ],
+  "cursor": 40,
+  "has_more": 0,
+  "total": 4
+}

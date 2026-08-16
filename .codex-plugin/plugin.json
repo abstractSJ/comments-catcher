@@ -1,0 +1,17 @@
+{
+  "name": "comments-catcher",
+  "version": "0.2.0",
+  "description": "Collect public Douyin or Bilibili comments through an existing authenticated WebBridge browser session.",
+  "author": {
+    "name": "comments-catcher"
+  },
+  "license": "MIT",
+  "keywords": [
+    "comments",
+    "douyin",
+    "bilibili",
+    "webbridge",
+    "data-export"
+  ],
+  "skills": "./skills/"
+}

@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:comments-catcher:output-schema:v1",
+  "title": "Comments Catcher Output Schema v1",
+  "description": "comments-catcher 0.1.x 的结构化评论与恢复状态输出。评论对象允许增加平台公开字段，但禁止写入认证材料。",
+  "type": "object",
+  "required": [
+    "meta",
+    "comments"
+  ],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "collector_version",
+        "aweme_id",
+        "all_count",
+        "fetched_count",
+        "sub_count",
+        "total_count",
+        "last_cursor",
+        "last_has_more",
+        "main_complete",
+        "main_page_count",
+        "sub_rate",
+        "seed",
+        "with_sub",
+        "sampled_cids",
+        "skipped_cids",
+        "sub_done_cids",
+        "updated_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0.0",
+          "description": "输出结构版本。"
+        },
+        "collector_version": {
+          "type": "string",
+          "minLength": 1,
+          "description": "生成此文件的采集器版本。"
+        },
+        "aweme_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "目标视频的 aweme_id。"
+        },
+        "all_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "页面或接口报告的一级评论总数。"
+        },
+        "fetched_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "当前文件中已保存的一级评论数。"
+        },
+        "sub_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "当前文件中已保存的二级回复数。"
+        },
+        "total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "一级评论和二级回复的合计记录数。"
+        },
+        "last_cursor": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ],
+          "description": "最近一次成功保存的一级评论分页游标。"
+        },
+        "last_has_more": {
+          "type": "integer",
+          "enum": [
+            0,
+            1
+          ],
+          "description": "最近一页是否报告仍有后续页面。"
+        },
+        "main_complete": {
+          "type": "boolean",
+          "description": "一级评论是否按当前目标和限制完成。"
+        },
+        "main_page_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "累计成功采集的一级评论页数。"
+        },
+        "sub_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "一级评论线程的回复采集抽样率。"
+        },
+        "seed": {
+          "type": "integer",
+          "description": "回复线程抽样使用的可复现整数种子。"
+        },
+        "with_sub": {
+          "type": "boolean",
+          "description": "本任务是否启用二级回复采集。"
+        },
+        "sampled_cids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "description": "确定性抽样命中的一级评论 cid。"
+        },
+        "skipped_cids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "description": "确定性抽样未命中的一级评论 cid。"
+        },
+        "sub_done_cids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "description": "已经完成二级回复采集的一级评论 cid。"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "最近一次原子保存的 UTC 时间。"
+        }
+      },
+      "additionalProperties": false
+    },
+    "comments": {
+      "type": "array",
+      "description": "一级评论数组。",
+      "items": {
+        "$ref": "#/$defs/comment"
+      }
+    },
+    "subs": {
+      "type": "array",
+      "description": "可选的回复线程；每项为 [root_cid, comments_array]。",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "string",
+            "minLength": 1,
+            "description": "所属一级评论的 cid。"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/comment"
+            }
+          }
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "comment": {
+      "type": "object",
+      "description": "规范化评论对象；允许增加公开平台字段以保持采集器向前兼容。",
+      "properties": {
+        "cid": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "create_time": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ]
+        },
+        "digg_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reply_comment_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "user": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "uid": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sec_uid": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "nickname": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}
