@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "comments-catcher",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Use an existing authenticated WebBridge browser session to collect public Douyin or Bilibili comments into privacy-conscious structured output.",
   "author": {
     "name": "comments-catcher"

@@ -1,6 +1,6 @@
 {
   "name": "comments-catcher",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Collect public Douyin or Bilibili comments through an existing authenticated WebBridge browser session.",
   "author": {
     "name": "comments-catcher"

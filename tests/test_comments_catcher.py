@@ -816,6 +816,22 @@ class SpaceModeTests(unittest.TestCase):
             with self.assertRaises(cc.ConfigError):
                 cc.run_space_batch(args, config, bridge)
 
+    def test_prepare_space_page_accepts_space_host(self):
+        # 回归测试：B 站主页域名 space.bilibili.com 必须在就绪检查白名单内，
+        # 否则批量模式会永远报“博主主页加载超时”。
+        client = cc.WebBridgeClient(
+            cc.CollectorConfig(platform=cc.PLATFORM_BILIBILI, delay=3.0)
+        )
+        client.send = mock.Mock(return_value={"ok": True})
+        client.eval_js = mock.Mock(return_value="space.bilibili.com")
+        client.captcha_state = mock.Mock(return_value="clear")
+
+        with mock.patch.object(cc.time, "sleep", return_value=None):
+            client.prepare_space_page(
+                "https://space.bilibili.com/289706107/video", wait_seconds=1
+            )
+        client.send.assert_called_once()
+
     def test_load_space_manifest_rejects_invalid_format(self):
         path = self.output_dir
         path.mkdir(parents=True)

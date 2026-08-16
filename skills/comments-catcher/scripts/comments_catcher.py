@@ -30,14 +30,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-COLLECTOR_VERSION = "0.5.0"
+COLLECTOR_VERSION = "0.5.1"
 SCHEMA_VERSION = "2.0.0"
 PLATFORM_AUTO = "auto"
 PLATFORM_DOUYIN = "douyin"
 PLATFORM_BILIBILI = "bilibili"
 SUPPORTED_PLATFORMS = {PLATFORM_DOUYIN, PLATFORM_BILIBILI}
 DOUYIN_HOSTS = {"www.douyin.com", "douyin.com"}
-BILIBILI_HOSTS = {"www.bilibili.com", "bilibili.com", "m.bilibili.com"}
+BILIBILI_HOSTS = {"www.bilibili.com", "bilibili.com", "m.bilibili.com", "space.bilibili.com"}
 DEFAULT_DAEMON_URL = "http://127.0.0.1:10086/command"
 DEFAULT_SESSIONS = {
     PLATFORM_DOUYIN: "douyin",
