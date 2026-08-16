@@ -20,6 +20,9 @@ python comments_catcher.py [VIDEO] [OPTIONS]
 | `VIDEO` | 按操作决定 | 抖音/B 站视频 URL 或平台 ID。 |
 | `--platform auto|douyin|bilibili` | `auto` | 自动识别或显式指定平台。健康检查无视频时默认检查抖音。 |
 | `--session NAME` | 按平台决定 | WebBridge 会话名；抖音默认 `douyin`，B 站默认 `bili-comments`。也可用 `COMMENTS_CATCHER_SESSION`。 |
+| `--space URL` | 不启用 | 博主主页批量模式：B 站 `space.bilibili.com/<mid>`（或裸 mid）或抖音 `douyin.com/user/<sec_uid>`；按发布时间新→旧串行采集每个视频的评论。不能与 `VIDEO`、`--output`、`--csv`、`--prepare-page`、`--reuse-current-page`、`--subs-only` 同用。 |
+| `--max-videos N` | 无（必填） | 批量模式采集的最近视频个数；`--space` 时必须显式指定，需先与用户确认数量。 |
+| `--output-dir DIR` | `space-comments-<博主ID>` | 批量模式输出目录；逐视频 JSON 与队列清单 `video_list.json` 写入该目录。 |
 
 ## 采集与输出参数
 
@@ -34,6 +37,8 @@ python comments_catcher.py [VIDEO] [OPTIONS]
 | `--max-pages N` | 不限制 | 本次最多新增采集的一级评论页数；达到上限时 `main_complete` 可能为 `false`。 |
 | `--delay SECONDS` | `5.0` | 请求、翻页或批次之间的基础等待秒数；实现规定最低为 `3.0` 秒。缺省读 `config.json`。 |
 | `--jitter-range RANGE` | `0.6` | 间隔随机抖动总幅度，`0.6` 表示实际间隔在基础值的 ±30% 内波动；范围 `0.0` 到 `2.0`。缺省读 `config.json`。 |
+| `--video-delay SECONDS` | `20.0` | 批量模式相邻两个视频之间的基础等待秒数，最低 `5.0`。缺省读 `config.json`。 |
+| `--dwell SECONDS` | `15.0` | 批量模式每个视频页面的停留浏览秒数（期间触发静音播放并轻微滚动，模拟真实观看）；`0` 表示不停留，范围 `0` 到 `600`。缺省读 `config.json`。 |
 | `--config FILE` | 技能目录 `config.json` | 自定义本地配置文件路径；文件不存在时报错。 |
 | `--include-user-identifiers` | 关闭 | 显式保存稳定 UID 与 IP 属地；默认留空以减少个人数据。 |
 
@@ -60,6 +65,8 @@ python comments_catcher.py [VIDEO] [OPTIONS]
 | `jitter_range` | 数值 | `0.6` | 间隔随机抖动总幅度，`0.6` 表示 ±30%，范围 `0.0` 到 `2.0`。 |
 | `sub_rate` | 数值 | `0.5` | 二级回复线程抽样比例，范围 `0` 到 `1`。 |
 | `seed` | 整数 | `42` | 确定性抽样种子。 |
+| `video_delay` | 数值 | `20.0` | 批量模式相邻视频的基础间隔秒数，最低 `5.0`。 |
+| `dwell` | 数值 | `15.0` | 批量模式每个视频页面的停留浏览秒数，范围 `0` 到 `600`。 |
 
 以 `_` 开头的键作为注释被忽略；其他未知键、非数值或超出范围的值都会在发起任何请求前报错。`sub_rate` 与 `seed` 修改后不能用于已有抽样决策的恢复文件。
 
@@ -76,7 +83,7 @@ python comments_catcher.py [VIDEO] [OPTIONS]
 
 ## 示例
 
-示例刻意不带 `--delay`、`--jitter-range`、`--sub-rate`、`--seed`，使 `config.json` 中的用户配置生效；仅当需要临时覆盖配置时才追加这些参数。
+示例刻意不带 `--delay`、`--jitter-range`、`--sub-rate`、`--seed`、`--video-delay`、`--dwell`，使 `config.json` 中的用户配置生效；仅当需要临时覆盖配置时才追加这些参数。
 
 抖音：
 
@@ -96,6 +103,18 @@ python ./skills/comments-catcher/scripts/comments_catcher.py \
   --output ./bilibili-comments.json \
   --with-sub
 ```
+
+博主主页批量模式（B 站 UP 主最近 20 个视频；数量必须先与用户确认）：
+
+```bash
+python ./skills/comments-catcher/scripts/comments_catcher.py \
+  --space "https://space.bilibili.com/289706107" \
+  --platform bilibili --session bili-comments \
+  --max-videos 20 --output-dir ./space-289706107 \
+  --with-sub
+```
+
+批量模式逐视频串行执行：打开视频页后触发静音播放并停留 `--dwell` 秒模拟观看，相邻视频按 `--video-delay` 秒间隔等待。单个视频失败记录原因后跳过，连续 3 个失败中止任务。输出目录下的 `video_list.json` 记录每个视频的 done/failed 状态，重跑同一命令自动跳过已完成视频；每个视频的 JSON 仍保留页级断点。
 
 单独打开并预检两个平台页面：
 

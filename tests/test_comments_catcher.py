@@ -337,6 +337,54 @@ class ConfigFileTests(unittest.TestCase):
         cc.CollectorConfig(jitter_range=0.0).validate()
         cc.CollectorConfig(jitter_range=2.0).validate()
 
+    def test_batch_pacing_keys_resolution(self):
+        self._write(
+            {
+                "delay": 4.0,
+                "video_delay": 30.0,
+                "dwell": 20.0,
+                "bilibili": {"video_delay": 45.0},
+            }
+        )
+        # 抖音：video_delay 读顶层通用值。
+        args, config = cc.parse_and_validate_args(
+            ["--health-check", "--platform", "douyin", "--config", str(self.config_path)]
+        )
+        self.assertEqual(config.video_delay, 30.0)
+        self.assertEqual(config.dwell, 20.0)
+
+        # B 站：video_delay 读平台小节，dwell 仍读顶层。
+        args, config = cc.parse_and_validate_args(
+            ["--health-check", "--platform", "bilibili", "--config", str(self.config_path)]
+        )
+        self.assertEqual(config.video_delay, 45.0)
+        self.assertEqual(config.dwell, 20.0)
+
+        # 命令行参数优先于平台小节；dwell 允许显式置 0（不停留）。
+        args, config = cc.parse_and_validate_args(
+            [
+                "--health-check",
+                "--platform",
+                "bilibili",
+                "--video-delay",
+                "10.0",
+                "--dwell",
+                "0",
+                "--config",
+                str(self.config_path),
+            ]
+        )
+        self.assertEqual(config.video_delay, 10.0)
+        self.assertEqual(config.dwell, 0.0)
+
+    def test_batch_pacing_invalid_values_rejected(self):
+        for bad in ({"video_delay": 4.9}, {"dwell": 601}, {"dwell": -1}):
+            self._write(bad)
+            with self.assertRaises(cc.ConfigError):
+                cc.parse_and_validate_args(
+                    ["--health-check", "--config", str(self.config_path)]
+                )
+
     def test_rate_sleep_uses_jitter_range(self):
         sleeps: list[float] = []
         config = cc.CollectorConfig(delay=4.0, jitter_range=0.4)
@@ -490,6 +538,291 @@ class StateAndCollectorTests(unittest.TestCase):
             next(params for endpoint, params in bridge.calls if endpoint == "comment/list/reply")["pn"],
             1,
         )
+
+
+class FakeSpaceBridge:
+    """批量模式替身：主页清单与单视频评论均为合成数据，不访问浏览器。"""
+
+    def __init__(self, video_ids, fail_on=()):
+        self.video_items = [
+            {"video_id": vid, "title": f"标题-{vid}"} for vid in video_ids
+        ]
+        self.fail_on = set(fail_on)
+        self.prepared_pages: list[str] = []
+        self.browse_calls = 0
+        self.space_url: str | None = None
+
+    def prepare_space_page(self, space_url: str) -> None:
+        self.space_url = space_url
+
+    def wait_captcha_clear(self) -> None:
+        pass
+
+    def collect_video_list(self, max_videos: int) -> list[dict]:
+        return [dict(item) for item in self.video_items[:max_videos]]
+
+    def prepare_page(self, video_id: str) -> dict:
+        if video_id in self.fail_on:
+            raise cc.PageNotReady("synthetic page failure")
+        self.prepared_pages.append(video_id)
+        return {"host": "www.bilibili.com", "page_ready": True, "oid": 1}
+
+    def simulate_browse(self) -> dict:
+        self.browse_calls += 1
+        return {"has_video": True, "play_requested": True}
+
+    def main_cursor_start(self) -> int:
+        return 1
+
+    def sub_cursor_start(self) -> int:
+        return 1
+
+    def fetch_json(self, endpoint: str, params: dict) -> dict:
+        if endpoint == "comment/list":
+            return {
+                "code": 0,
+                "comments": [
+                    {
+                        "cid": f"c-{params['next']}",
+                        "text": "合成评论",
+                        "reply_comment_total": 0,
+                    }
+                ],
+                "cursor": int(params["next"]) + 1,
+                "has_more": 0,
+                "total": 1,
+            }
+        raise AssertionError("测试未开启二级评论")
+
+
+class SpaceModeTests(unittest.TestCase):
+    """博主主页批量模式的解析、清单合并与队列行为测试。"""
+
+    VIDEO_IDS = ["BV1aaaaaaaa0", "BV1bbbbbbbb0", "BV1cccccccc0"]
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.output_dir = Path(self.temp.name) / "space-out"
+        self.config_path = Path(self.temp.name) / "config.json"
+        self.config_path.write_text(
+            json.dumps({"delay": 3.0, "video_delay": 8.0, "dwell": 5.0}),
+            encoding="utf-8",
+        )
+
+    def _space_args(self, extra=()):
+        argv = [
+            "--space",
+            "https://space.bilibili.com/289706107",
+            "--platform",
+            "bilibili",
+            "--max-videos",
+            "3",
+            "--output-dir",
+            str(self.output_dir),
+            "--config",
+            str(self.config_path),
+        ] + list(extra)
+        return cc.parse_and_validate_args(argv)
+
+    def _run_batch(self, bridge):
+        args, config = self._space_args()
+        with mock.patch.object(cc, "jittered_sleep") as sleep_mock:
+            code = cc.run_space_batch(args, config, bridge)
+        return code, sleep_mock
+
+    def _manifest(self) -> dict:
+        return json.loads(
+            (self.output_dir / cc.SPACE_MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+
+    def test_extract_space_target_bilibili(self):
+        mid, url = cc.extract_space_target(
+            "https://space.bilibili.com/289706107?spm_id_from=333.788.upinfo.detail.click",
+            cc.PLATFORM_BILIBILI,
+        )
+        self.assertEqual(mid, "289706107")
+        self.assertEqual(url, "https://space.bilibili.com/289706107/video")
+        self.assertEqual(
+            cc.extract_space_target("289706107", cc.PLATFORM_BILIBILI)[0], "289706107"
+        )
+        with self.assertRaises(cc.ConfigError):
+            cc.extract_space_target("https://www.bilibili.com/video/BV1qnuq6dEga", cc.PLATFORM_BILIBILI)
+        self.assertEqual(
+            cc.detect_platform("https://space.bilibili.com/289706107"),
+            cc.PLATFORM_BILIBILI,
+        )
+
+    def test_extract_space_target_douyin(self):
+        sec_uid, url = cc.extract_space_target(
+            "https://www.douyin.com/user/MS4wLjABAAAA-something",
+            cc.PLATFORM_DOUYIN,
+        )
+        self.assertEqual(sec_uid, "MS4wLjABAAAA-something")
+        self.assertEqual(url, "https://www.douyin.com/user/MS4wLjABAAAA-something")
+        with self.assertRaises(cc.ConfigError):
+            cc.extract_space_target("https://www.douyin.com/video/7674214863132396011", cc.PLATFORM_DOUYIN)
+
+    def test_parse_video_card_href(self):
+        self.assertEqual(
+            cc.parse_video_card_href(
+                "https://www.bilibili.com/video/BV1qnuq6dEga/?spm_id_from=333",
+                cc.PLATFORM_BILIBILI,
+            ),
+            "BV1qnuq6dEga",
+        )
+        self.assertEqual(
+            cc.parse_video_card_href(
+                "https://www.douyin.com/video/7674214863132396011",
+                cc.PLATFORM_DOUYIN,
+            ),
+            "7674214863132396011",
+        )
+        # 图文 /note/ 与非视频链接不属于评论采集范围。
+        self.assertIsNone(
+            cc.parse_video_card_href(
+                "https://www.douyin.com/note/7674214863132396011", cc.PLATFORM_DOUYIN
+            )
+        )
+        self.assertIsNone(
+            cc.parse_video_card_href(
+                "https://www.bilibili.com/read/cv123", cc.PLATFORM_BILIBILI
+            )
+        )
+
+    def test_merge_space_videos_preserves_status_and_truncates(self):
+        manifest = cc.new_space_manifest(
+            cc.PLATFORM_BILIBILI, "289706107", "https://space.bilibili.com/289706107/video"
+        )
+        items = [{"video_id": vid, "title": f"t-{vid}"} for vid in self.VIDEO_IDS]
+        cc.merge_space_videos(manifest, items, 3)
+        manifest["videos"][0]["status"] = "done"
+        manifest["videos"][0]["comments"] = 12
+
+        # 主页出现更新视频后重合并：既有状态保留、顺序跟随主页、超出上限的旧视频出队。
+        new_items = [
+            {"video_id": "BV1dddddddd0", "title": "t-new"},
+            {"video_id": self.VIDEO_IDS[0], "title": "t-0"},
+            {"video_id": self.VIDEO_IDS[1], "title": "t-1"},
+            {"video_id": self.VIDEO_IDS[2], "title": "t-2"},
+        ]
+        cc.merge_space_videos(manifest, new_items, 3)
+        ids = [v["video_id"] for v in manifest["videos"]]
+        self.assertEqual(ids, ["BV1dddddddd0", self.VIDEO_IDS[0], self.VIDEO_IDS[1]])
+        self.assertEqual(manifest["videos"][1]["status"], "done")
+        self.assertEqual(manifest["videos"][1]["comments"], 12)
+        self.assertEqual(manifest["videos"][0]["status"], "pending")
+
+    def test_space_args_validation(self):
+        # --max-videos 缺失或非法：批量模式拒绝替用户决定抓取规模。
+        with self.assertRaises(cc.ConfigError):
+            cc.parse_and_validate_args(
+                ["--space", "https://space.bilibili.com/289706107", "--config", str(self.config_path)]
+            )
+        with self.assertRaises(cc.ConfigError):
+            cc.parse_and_validate_args(
+                [
+                    "--space", "https://space.bilibili.com/289706107",
+                    "--max-videos", "0",
+                    "--config", str(self.config_path),
+                ]
+            )
+        # 单视频参数与批量模式互斥。
+        with self.assertRaises(cc.ConfigError):
+            cc.parse_and_validate_args(
+                [
+                    "BV1qnuq6dEga",
+                    "--space", "https://space.bilibili.com/289706107",
+                    "--max-videos", "3",
+                    "--config", str(self.config_path),
+                ]
+            )
+        with self.assertRaises(cc.ConfigError):
+            self._space_args(extra=["--output", "x.json"])
+        # 批量专属参数不能脱离 --space 使用。
+        with self.assertRaises(cc.ConfigError):
+            cc.parse_and_validate_args(
+                ["BV1qnuq6dEga", "--max-videos", "3", "--config", str(self.config_path)]
+            )
+
+    def test_run_space_batch_success(self):
+        bridge = FakeSpaceBridge(self.VIDEO_IDS)
+        code, sleep_mock = self._run_batch(bridge)
+
+        self.assertEqual(code, cc.EXIT_OK)
+        self.assertEqual(bridge.space_url, "https://space.bilibili.com/289706107/video")
+        # 串行按主页顺序逐视频处理，且每个视频都触发了浏览模拟。
+        self.assertEqual(bridge.prepared_pages, self.VIDEO_IDS)
+        self.assertEqual(bridge.browse_calls, 3)
+
+        # 停留 3 次（dwell=5）+ 视频间隔 2 次（video_delay=8，最后一个视频后不等待）。
+        waits = [call.args[0] for call in sleep_mock.call_args_list]
+        self.assertEqual(waits, [5.0, 8.0, 5.0, 8.0, 5.0])
+
+        for vid in self.VIDEO_IDS:
+            document = json.loads(
+                (self.output_dir / f"{vid}.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(document["meta"]["platform"], "bilibili")
+            self.assertEqual(document["meta"]["video_id"], vid)
+            self.assertTrue(document["meta"]["main_complete"])
+
+        videos = self._manifest()["videos"]
+        self.assertEqual([v["status"] for v in videos], ["done"] * 3)
+        self.assertEqual([v["comments"] for v in videos], [1, 1, 1])
+
+    def test_run_space_batch_skips_failed_and_continues(self):
+        bridge = FakeSpaceBridge(self.VIDEO_IDS, fail_on={self.VIDEO_IDS[1]})
+        code, _ = self._run_batch(bridge)
+
+        self.assertEqual(code, cc.EXIT_OK)
+        videos = self._manifest()["videos"]
+        self.assertEqual([v["status"] for v in videos], ["done", "failed", "done"])
+        self.assertIn("synthetic page failure", videos[1]["error"])
+        # 中间视频失败后仍继续采集第三个视频。
+        self.assertEqual(
+            bridge.prepared_pages, [self.VIDEO_IDS[0], self.VIDEO_IDS[2]]
+        )
+
+    def test_run_space_batch_aborts_after_consecutive_failures(self):
+        bridge = FakeSpaceBridge(self.VIDEO_IDS, fail_on=set(self.VIDEO_IDS))
+        args, config = self._space_args()
+        with mock.patch.object(cc, "jittered_sleep"):
+            with self.assertRaises(cc.CollectionError):
+                cc.run_space_batch(args, config, bridge)
+
+        videos = self._manifest()["videos"]
+        self.assertEqual([v["status"] for v in videos], ["failed"] * 3)
+
+    def test_run_space_batch_resume_skips_done(self):
+        bridge = FakeSpaceBridge(self.VIDEO_IDS)
+        self._run_batch(bridge)
+        # 重跑同一命令：全部已完成，不再打开任何视频页。
+        code, _ = self._run_batch(bridge)
+        self.assertEqual(code, cc.EXIT_OK)
+        self.assertEqual(bridge.prepared_pages, self.VIDEO_IDS)
+
+    def test_run_space_batch_rejects_mismatched_manifest(self):
+        bridge = FakeSpaceBridge(self.VIDEO_IDS)
+        self._run_batch(bridge)
+        # 把清单改成其他博主后重跑，必须拒绝混用而不是静默覆盖。
+        manifest = self._manifest()
+        manifest["user_id"] = "999999"
+        (self.output_dir / cc.SPACE_MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+        )
+        args, config = self._space_args()
+        with mock.patch.object(cc, "jittered_sleep"):
+            with self.assertRaises(cc.ConfigError):
+                cc.run_space_batch(args, config, bridge)
+
+    def test_load_space_manifest_rejects_invalid_format(self):
+        path = self.output_dir
+        path.mkdir(parents=True)
+        bad = path / cc.SPACE_MANIFEST_NAME
+        bad.write_text(json.dumps({"no_videos": True}), encoding="utf-8")
+        with self.assertRaises(cc.ConfigError):
+            cc.load_space_manifest(bad)
 
 
 class CaptchaAndHealthTests(unittest.TestCase):

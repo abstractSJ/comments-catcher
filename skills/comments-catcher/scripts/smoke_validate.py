@@ -123,6 +123,8 @@ def offline_check() -> dict:
             platform=platform,
             delay=float(merged.get("delay", module.DEFAULT_DELAY)),
             jitter_range=float(merged.get("jitter_range", module.DEFAULT_JITTER_RANGE)),
+            video_delay=float(merged.get("video_delay", module.DEFAULT_VIDEO_DELAY)),
+            dwell=float(merged.get("dwell", module.DEFAULT_DWELL)),
         )
         probe.validate()
         module.validate_sub_rate(float(merged.get("sub_rate", module.DEFAULT_SUB_RATE)))

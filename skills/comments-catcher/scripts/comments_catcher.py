@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-COLLECTOR_VERSION = "0.4.0"
+COLLECTOR_VERSION = "0.5.0"
 SCHEMA_VERSION = "2.0.0"
 PLATFORM_AUTO = "auto"
 PLATFORM_DOUYIN = "douyin"
@@ -50,6 +50,20 @@ DEFAULT_JITTER_RANGE = 0.6
 MAX_JITTER_RANGE = 2.0
 DEFAULT_SUB_RATE = 0.5
 DEFAULT_SEED = 42
+# 批量模式（--space）的视频级节奏：批量任务请求总量随视频数线性放大，
+# 视频之间的间隔是比页级 delay 更主要的风控保护层。
+DEFAULT_VIDEO_DELAY = 20.0
+MIN_VIDEO_DELAY = 5.0
+# 每个视频页面的停留浏览秒数；0 表示不停留，上限防止误配置成超长挂起。
+DEFAULT_DWELL = 15.0
+MAX_DWELL = 600.0
+# 主页连续滚动多少轮都没有新视频出现时认为清单已经到底。
+SPACE_LIST_STABLE_SCROLLS = 3
+# 连续多少个视频失败就中止整个批量任务：单点失败通常是视频本身问题，
+# 连续失败更可能是风控或登录失效，继续重试只会放大风险。
+MAX_CONSECUTIVE_VIDEO_FAILURES = 3
+SPACE_MANIFEST_NAME = "video_list.json"
+SPACE_MANIFEST_SCHEMA = 1
 
 # 技能目录（scripts/ 的上一级）下的 config.json 是默认本地配置文件；
 # 用 __file__ 定位而不是当前工作目录，保证从任意目录调用都读到同一份配置。
@@ -120,6 +134,8 @@ class CollectorConfig:
         retry_base_delay: 指数退避的基准秒数。
         delay: 相邻评论请求之间的基础间隔秒数。
         jitter_range: 间隔随机抖动总幅度；0.6 表示 ±30%。
+        video_delay: 批量模式下相邻两个视频之间的基础间隔秒数。
+        dwell: 批量模式下每个视频页面的停留浏览秒数。
         page_size: 每页请求条数，保持与网页常用页大小一致。
         captcha_wait_seconds: 可见验证弹窗允许人工处理的最长等待时间。
         include_user_identifiers: 是否保存稳定用户 ID 与 IP 属地字段。
@@ -134,6 +150,8 @@ class CollectorConfig:
     retry_base_delay: float = 3.0
     delay: float = DEFAULT_DELAY
     jitter_range: float = DEFAULT_JITTER_RANGE
+    video_delay: float = DEFAULT_VIDEO_DELAY
+    dwell: float = DEFAULT_DWELL
     page_size: int = 20
     captcha_wait_seconds: int = 180
     include_user_identifiers: bool = False
@@ -155,6 +173,10 @@ class CollectorConfig:
             raise ConfigError(
                 f"jitter_range 必须是 0.0 到 {MAX_JITTER_RANGE:.1f} 之间的有限数"
             )
+        if not math.isfinite(self.video_delay) or self.video_delay < MIN_VIDEO_DELAY:
+            raise ConfigError(f"视频间隔必须是不小于 {MIN_VIDEO_DELAY:.1f} 秒的有限数")
+        if not math.isfinite(self.dwell) or not 0.0 <= self.dwell <= MAX_DWELL:
+            raise ConfigError(f"页面停留时长必须是 0 到 {MAX_DWELL:.0f} 秒之间的有限数")
         if self.max_retry < 1:
             raise ConfigError("max_retry 必须至少为 1")
         if self.page_size < 1 or self.page_size > 50:
@@ -181,6 +203,45 @@ class BridgeLike(Protocol):
 
 class WebBridgeClient:
     """Kimi WebBridge 本地 daemon 客户端及页面状态管理器。"""
+
+    # 从主页 DOM 中提取视频卡片链接。B 站与抖音主页默认都按发布时间新→旧排序，
+    # 因此 Map 的插入顺序（即 DOM 顺序）就是采集顺序，无需解析相对时间文本。
+    VIDEO_CARDS_JS = r"""
+    (() => {
+      const map = new Map();
+      for (const a of document.querySelectorAll('a[href*="/video/"]')) {
+        const href = (a.href || '').split('?')[0];
+        if (!href) continue;
+        const title = (a.getAttribute('title') || a.textContent || '').trim();
+        const prev = map.get(href);
+        // 同一视频常有封面与标题两个锚点；优先保留非空标题的那一条。
+        if (!prev || (!prev.title && title)) {
+          map.set(href, {href, title: title.slice(0, 200)});
+        }
+      }
+      return [...map.values()];
+    })()
+    """
+
+    # 模拟真实用户浏览：静音触发播放（浏览器自动播放策略通常只允许静音的脚本化
+    # 播放），随后轻微下滚，模拟用户看完开头后向评论区移动视线。不点击任何按钮、
+    # 不修改播放以外的页面状态。
+    SIMULATE_BROWSE_JS = r"""
+    (() => {
+      const video = document.querySelector('video');
+      let play_requested = false;
+      if (video) {
+        video.muted = true;
+        try {
+          const p = video.play();
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+          play_requested = true;
+        } catch (error) {}
+      }
+      window.scrollTo(0, Math.min(600, Math.max(0, document.body.scrollHeight - window.innerHeight)));
+      return {has_video: Boolean(video), play_requested};
+    })()
+    """
 
     CAPTCHA_CHECK_JS = r"""
     (() => {
@@ -447,6 +508,90 @@ class WebBridgeClient:
                 last_error = str(exc)
         raise PageNotReady(last_error)
 
+    def prepare_space_page(self, space_url: str, wait_seconds: int = 30) -> None:
+        """
+        在当前 WebBridge 会话中打开博主主页并等待站点加载。
+
+        主页不是视频页，没有 B 站 aid 或抖音签名就绪标志可读，因此这里只校验
+        页面域名落在目标平台，再叠加验证弹窗检查。
+        """
+        response = self.send(
+            "navigate",
+            {"url": space_url, "newTab": False, "group_title": "Comments Catcher"},
+        )
+        if not response.get("ok"):
+            message = response.get("error", {}).get("message", "navigate 失败")
+            raise PageNotReady(str(message))
+
+        expected_hosts = (
+            BILIBILI_HOSTS if self.config.platform == PLATFORM_BILIBILI else DOUYIN_HOSTS
+        )
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            try:
+                host = self.eval_js("location.hostname")
+            except PageNotReady:
+                continue
+            if host not in expected_hosts:
+                continue
+            captcha = self.captcha_state()
+            if captcha == "visible":
+                raise ManualActionRequired("主页已打开，但需要用户手动完成人机验证")
+            if captcha == "check_failed":
+                continue
+            return
+        raise PageNotReady("博主主页加载超时，请确认主页链接可公开访问")
+
+    def _scroll_to_bottom(self) -> None:
+        """滚动主页触发懒加载；滚动失败不致命，下一轮收集会再次尝试。"""
+        try:
+            self.eval_js("window.scrollTo(0, document.body.scrollHeight)")
+        except PageNotReady:
+            pass
+
+    def collect_video_list(self, max_videos: int, sleeper=time.sleep) -> list[dict[str, str]]:
+        """
+        在当前主页上边滚动边收集视频清单，按页面顺序（新→旧）返回。
+
+        主页视频列表是懒加载的：只有滚动到底部才会渲染更多卡片。连续
+        ``SPACE_LIST_STABLE_SCROLLS`` 轮滚动都没有新视频时认为清单已经到底。
+        """
+        items: list[dict[str, str]] = []
+        seen: set[str] = set()
+        stable_rounds = 0
+        while len(items) < max_videos and stable_rounds < SPACE_LIST_STABLE_SCROLLS:
+            cards = self.eval_js(self.VIDEO_CARDS_JS)
+            if not isinstance(cards, list):
+                cards = []
+            added = 0
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                video_id = parse_video_card_href(
+                    str(card.get("href") or ""), self.config.platform
+                )
+                if not video_id or video_id in seen:
+                    continue
+                seen.add(video_id)
+                items.append(
+                    {"video_id": video_id, "title": str(card.get("title") or "")}
+                )
+                added += 1
+                if len(items) >= max_videos:
+                    break
+            stable_rounds = stable_rounds + 1 if added == 0 else 0
+            if len(items) >= max_videos:
+                break
+            self._scroll_to_bottom()
+            rate_sleep(self.config, sleeper=sleeper)
+        return items
+
+    def simulate_browse(self) -> dict[str, Any]:
+        """触发视频静音播放并轻微下滚，返回页面反馈供日志记录。"""
+        result = self.eval_js(self.SIMULATE_BROWSE_JS)
+        return result if isinstance(result, dict) else {}
+
     def fetch_json(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
         """在页面上下文请求一页评论，并返回统一的精简字段。"""
         if self.config.platform == PLATFORM_BILIBILI:
@@ -685,6 +830,57 @@ def extract_video_id(value: str, platform: str) -> str:
     raise ConfigError(f"不支持的平台：{platform}")
 
 
+def extract_space_target(value: str, platform: str) -> tuple[str, str]:
+    """
+    解析博主主页输入，返回（博主 ID, 规范化主页 URL）。
+
+    B 站接受 ``space.bilibili.com/<mid>``（允许带无关查询参数）或裸 mid 数字；
+    抖音接受 ``douyin.com/user/<sec_uid>``。规范化 URL 直接指向视频列表页，
+    避免跟踪参数或默认 Tab 差异影响卡片收集。
+    """
+    value = value.strip()
+    if platform == PLATFORM_BILIBILI:
+        match = re.search(r"space\.bilibili\.com/(\d+)", value)
+        if match:
+            mid = match.group(1)
+        elif re.fullmatch(r"\d+", value):
+            mid = value
+        else:
+            raise ConfigError(
+                f"无法从输入中解析 B 站博主 ID: {value}；"
+                "请提供 space.bilibili.com/<mid> 主页链接或 mid 数字"
+            )
+        return mid, f"https://space.bilibili.com/{mid}/video"
+
+    if platform == PLATFORM_DOUYIN:
+        match = re.search(r"douyin\.com/user/([A-Za-z0-9_-]+)", value)
+        if not match:
+            raise ConfigError(
+                f"无法从输入中解析抖音博主主页: {value}；"
+                "请提供 douyin.com/user/<sec_uid> 主页链接"
+            )
+        sec_uid = match.group(1)
+        return sec_uid, f"https://www.douyin.com/user/{sec_uid}"
+
+    raise ConfigError(f"不支持的平台：{platform}")
+
+
+def parse_video_card_href(href: str, platform: str) -> str | None:
+    """
+    从主页视频卡片链接中解析视频 ID；不是视频链接时返回 None。
+
+    抖音图文等内容使用 /note/ 路径，不在评论采集范围内，自然被这里过滤掉。
+    """
+    if platform == PLATFORM_BILIBILI:
+        match = re.search(r"(?i)/video/(BV[0-9A-Za-z]{10})", href)
+        if match:
+            raw = match.group(1)
+            return "BV" + raw[2:]
+        return None
+    match = re.search(r"/video/(\d{15,})", href)
+    return match.group(1) if match else None
+
+
 def extract_aweme_id(value: str) -> str:
     """兼容旧调用方的抖音 ID 解析函数。"""
     return extract_douyin_id(value)
@@ -703,6 +899,8 @@ CONFIG_FILE_KEYS = {
     "jitter_range": "间隔随机抖动总幅度",
     "sub_rate": "二级回复线程抽样比例",
     "seed": "确定性抽样种子",
+    "video_delay": "批量模式下相邻视频之间的基础间隔秒数",
+    "dwell": "批量模式下每个视频页面的停留浏览秒数",
 }
 
 
@@ -845,10 +1043,20 @@ def build_url(endpoint: str, params: dict[str, Any]) -> str:
     return build_douyin_url(endpoint, params)
 
 
+def jittered_sleep(
+    seconds: float,
+    config: CollectorConfig,
+    sleeper=time.sleep,
+    random_fn=random.random,
+) -> None:
+    """按统一抖动规则等待指定秒数；视频级间隔与页面停留复用页级抖动配置。"""
+    factor = 1.0 + (random_fn() - 0.5) * config.jitter_range
+    sleeper(seconds * factor)
+
+
 def rate_sleep(config: CollectorConfig, sleeper=time.sleep, random_fn=random.random) -> None:
     """按基础间隔与随机抖动串行等待，避免对站点造成突发负载。"""
-    factor = 1.0 + (random_fn() - 0.5) * config.jitter_range
-    sleeper(config.delay * factor)
+    jittered_sleep(config.delay, config, sleeper, random_fn)
 
 
 def request_with_retry(
@@ -1113,6 +1321,87 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         raise CollectionError(f"保存进度失败: {exc}") from exc
 
 
+def new_space_manifest(platform: str, user_id: str, space_url: str) -> dict[str, Any]:
+    """创建博主主页批量任务的视频清单（队列层断点）。"""
+    return {
+        "schema": SPACE_MANIFEST_SCHEMA,
+        "platform": platform,
+        "user_id": user_id,
+        "space_url": space_url,
+        "updated_at": utc_now_iso(),
+        "videos": [],
+    }
+
+
+def load_space_manifest(path: Path) -> dict[str, Any] | None:
+    """读取视频清单；文件不存在时返回 None，格式错误时 fail-fast。"""
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"无法读取视频清单 {path}: {exc}") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get("videos"), list):
+        raise ConfigError(f"视频清单 {path} 格式无效：缺少 videos 数组")
+    return raw
+
+
+def merge_space_videos(
+    manifest: dict[str, Any],
+    items: list[dict[str, str]],
+    max_videos: int,
+) -> dict[str, Any]:
+    """
+    把主页最新视频清单合并进任务队列。
+
+    主页顺序（新→旧）是队列顺序的唯一事实来源；已存在条目的
+    status/comments/subs/error 全部保留，使重跑同一命令可以跳过已完成视频。
+    超出 ``max_videos`` 的旧条目被移出队列（其已采集的 JSON 文件不受影响）。
+    """
+    existing: dict[str, dict[str, Any]] = {}
+    for entry in manifest.get("videos", []):
+        if isinstance(entry, dict) and entry.get("video_id"):
+            existing[str(entry["video_id"])] = entry
+
+    merged: list[dict[str, Any]] = []
+    for item in items[:max_videos]:
+        video_id = str(item["video_id"])
+        previous = existing.get(video_id)
+        if previous:
+            entry = dict(previous)
+            if item.get("title") and not entry.get("title"):
+                entry["title"] = str(item["title"])
+            entry.setdefault("status", "pending")
+            entry.setdefault("comments", 0)
+            entry.setdefault("subs", 0)
+            entry.setdefault("error", None)
+        else:
+            entry = {
+                "video_id": video_id,
+                "title": str(item.get("title") or ""),
+                "status": "pending",
+                "comments": 0,
+                "subs": 0,
+                "error": None,
+            }
+        merged.append(entry)
+    manifest["videos"] = merged
+    return manifest
+
+
+def save_space_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    """原子保存视频清单，保证进程中断时不会留下写了一半的队列。"""
+    manifest["updated_at"] = utc_now_iso()
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise CollectionError(f"保存视频清单失败: {exc}") from exc
+
+
 class CommentsCollector:
     """双平台一级评论与按线程抽样的二级评论采集流程。"""
 
@@ -1361,12 +1650,160 @@ def export_csv(path: Path, state: dict[str, Any]) -> None:
     print(f"[CSV] {path}，共 {len(rows)} 行")
 
 
+def run_space_batch(args: argparse.Namespace, config: CollectorConfig, bridge: WebBridgeClient) -> int:
+    """
+    博主主页批量模式：按主页顺序（新→旧）串行采集每个视频的评论。
+
+    队列层断点写在 ``<output-dir>/video_list.json``（每个视频的 done/failed 状态），
+    视频层断点沿用单视频 v2 状态文件；两层叠加使“第 N 个视频第 M 页中断”可以
+    原样续跑。单个视频失败只记录并跳过；连续失败达到上限时判定为风控或登录
+    失效，中止整个任务等待人工检查。
+    """
+    platform = config.platform
+    user_id, space_url = extract_space_target(args.space, platform)
+    output_dir = Path(
+        args.output_dir or f"space-comments-{user_id}"
+    ).expanduser().resolve()
+    if output_dir.exists() and not output_dir.is_dir():
+        raise ConfigError(f"--output-dir 指向的不是目录: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / SPACE_MANIFEST_NAME
+
+    source_note = f"，配置来源 {args.config_source}" if args.config_source else "，未使用配置文件"
+    print(
+        f"[运行参数] 基础间隔={config.delay:.1f}s，视频间隔={config.video_delay:.1f}s，"
+        f"页面停留={config.dwell:.1f}s，抖动幅度={config.jitter_range:.2f}"
+        f"（±{config.jitter_range / 2:.0%}），抽样率={args.sub_rate:.2f}，"
+        f"种子={args.seed}{source_note}",
+        flush=True,
+    )
+
+    print(f"[主页] 打开 {space_url}", flush=True)
+    bridge.prepare_space_page(space_url)
+    bridge.wait_captcha_clear()
+
+    items = bridge.collect_video_list(args.max_videos)
+    if not items:
+        raise CollectionError(
+            "未在主页发现任何视频；请确认主页可公开访问、登录状态正常，且页面没有未处理的验证"
+        )
+
+    manifest = load_space_manifest(manifest_path)
+    if manifest is None:
+        manifest = new_space_manifest(platform, user_id, space_url)
+    elif (
+        str(manifest.get("platform")) != platform
+        or str(manifest.get("user_id")) != user_id
+    ):
+        raise ConfigError(
+            f"{manifest_path} 属于其他平台或博主，不能混用；请更换 --output-dir"
+        )
+    merge_space_videos(manifest, items, args.max_videos)
+    save_space_manifest(manifest_path, manifest)
+
+    videos = manifest["videos"]
+    total = len(videos)
+    pending_total = sum(1 for v in videos if v.get("status") != "done")
+    print(
+        f"[批量] 主页视频 {total} 个（按发布时间新→旧），待采集 {pending_total} 个",
+        flush=True,
+    )
+
+    consecutive_failures = 0
+    for index, entry in enumerate(videos, 1):
+        if entry.get("status") == "done":
+            print(f"[批量] {index}/{total} {entry['video_id']} 已完成，跳过")
+            continue
+        video_id = str(entry["video_id"])
+        print(f"[批量] {index}/{total} 视频 {video_id}（{entry.get('title') or '无标题'}）", flush=True)
+        try:
+            bridge.prepare_page(video_id)
+            browse = bridge.simulate_browse()
+            if config.dwell > 0:
+                if browse.get("has_video"):
+                    print(f"  [浏览模拟] 已触发静音播放，停留 {config.dwell:.0f}s 模拟观看")
+                jittered_sleep(config.dwell, config)
+            bridge.wait_captcha_clear()
+
+            output_path = output_dir / f"{video_id}.json"
+            state = load_state(output_path)
+            if state is None:
+                state = new_state(
+                    video_id, args.sub_rate, args.seed, args.with_sub, platform=platform
+                )
+            else:
+                validate_resume_state(
+                    state, video_id, args.sub_rate, args.seed, platform=platform
+                )
+                state["meta"]["with_sub"] = bool(
+                    state["meta"].get("with_sub") or args.with_sub
+                )
+
+            collector = CommentsCollector(bridge, config, output_path, state)
+            collector.fetch_main(max_pages=args.max_pages)
+            if args.with_sub:
+                collector.fetch_subs()
+            save_state(output_path, state)
+
+            summary = serialize_state(state)["meta"]
+            entry.update(
+                {
+                    "status": "done",
+                    "comments": summary["fetched_count"],
+                    "subs": summary["sub_count"],
+                    "error": None,
+                }
+            )
+            consecutive_failures = 0
+            print(
+                f"  [批量进度] {video_id} 完成：一级 {summary['fetched_count']} 条 "
+                f"+ 二级 {summary['sub_count']} 条"
+            )
+        except (CollectionError, PageNotReady) as exc:
+            entry["status"] = "failed"
+            entry["error"] = str(exc)
+            consecutive_failures += 1
+            print(f"  [批量警告] {video_id} 采集失败：{exc}；跳过并继续下一个视频")
+            save_space_manifest(manifest_path, manifest)
+            if consecutive_failures >= MAX_CONSECUTIVE_VIDEO_FAILURES:
+                raise CollectionError(
+                    f"连续 {MAX_CONSECUTIVE_VIDEO_FAILURES} 个视频采集失败，"
+                    "可能触发风控或登录失效；进度已保存，"
+                    "请检查浏览器会话后重跑同一命令续采"
+                ) from exc
+        save_space_manifest(manifest_path, manifest)
+
+        # 视频之间按 video_delay 等待；后面没有待采视频时不再等待。
+        remaining = any(v.get("status") != "done" for v in videos[index:])
+        if remaining:
+            jittered_sleep(config.video_delay, config)
+
+    done = sum(1 for v in videos if v.get("status") == "done")
+    failed = sum(1 for v in videos if v.get("status") == "failed")
+    print(f"[批量完成] 成功 {done}/{total}，失败 {failed}；清单 {manifest_path}")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(
         description="通过 Kimi WebBridge 采集抖音或 B 站视频评论（串行、可恢复、人工验证感知）"
     )
     parser.add_argument("video", nargs="?", help="抖音/B 站视频 URL、aweme_id、BV 号或 av 号")
+    parser.add_argument(
+        "--space",
+        help="博主主页批量模式：B 站 space.bilibili.com/<mid> 或抖音 user 主页链接；"
+        "按发布时间新→旧串行采集每个视频的评论",
+    )
+    parser.add_argument(
+        "--max-videos",
+        type=int,
+        help="批量模式采集的最近视频个数；--space 必填，需先与用户确认数量",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="批量模式输出目录；默认 space-comments-<博主ID>；逐视频 JSON 与 video_list.json 写入该目录",
+    )
     parser.add_argument(
         "--platform",
         choices=[PLATFORM_AUTO, PLATFORM_DOUYIN, PLATFORM_BILIBILI],
@@ -1401,6 +1838,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="间隔随机抖动总幅度，0.6 表示 ±30%%；缺省读 config.json，内置默认 0.6",
+    )
+    parser.add_argument(
+        "--video-delay",
+        type=float,
+        default=None,
+        help="批量模式相邻视频的基础间隔秒数，最低 5.0；缺省读 config.json，内置默认 20.0",
+    )
+    parser.add_argument(
+        "--dwell",
+        type=float,
+        default=None,
+        help="批量模式每个视频页面的停留浏览秒数，0 表示不停留；缺省读 config.json，内置默认 15.0",
     )
     parser.add_argument(
         "--config",
@@ -1442,14 +1891,41 @@ def parse_and_validate_args(argv: list[str] | None = None) -> tuple[argparse.Nam
     args = parser.parse_args(argv)
     if args.max_pages is not None and args.max_pages <= 0:
         raise ConfigError("--max-pages 必须大于 0")
+    if args.max_videos is not None and args.max_videos <= 0:
+        raise ConfigError("--max-videos 必须大于 0")
     if args.subs_only:
         args.with_sub = True
     if args.prepare_page and args.reuse_current_page:
         raise ConfigError("--prepare-page 不能与 --reuse-current-page 同时使用")
-    if not args.health_check and not args.video:
-        raise ConfigError("采集或准备页面时必须提供视频 URL/ID")
 
-    args.platform = detect_platform(args.video, args.platform)
+    if args.space:
+        # 批量模式与单视频模式的参数集合互斥，防止输出路径语义混乱：
+        # 批量输出一律落在 --output-dir 下按视频 ID 命名。
+        if args.video:
+            raise ConfigError("--space 批量模式不能同时提供单个视频参数")
+        for used, name in (
+            (args.output, "--output"),
+            (args.csv, "--csv"),
+            (args.prepare_page, "--prepare-page"),
+            (args.reuse_current_page, "--reuse-current-page"),
+            (args.subs_only, "--subs-only"),
+        ):
+            if used:
+                raise ConfigError(f"{name} 仅用于单视频模式，不能与 --space 同用")
+        if args.max_videos is None:
+            # 视频数量必须由用户拍板，实现不提供默认值，避免替用户决定抓取规模。
+            raise ConfigError(
+                "--space 批量模式必须显式指定 --max-videos（请先与用户确认要采集的最近视频个数）"
+            )
+    else:
+        if args.max_videos is not None:
+            raise ConfigError("--max-videos 只能与 --space 一起使用")
+        if args.output_dir:
+            raise ConfigError("--output-dir 只能与 --space 一起使用")
+    if not args.health_check and not args.video and not args.space:
+        raise ConfigError("采集或准备页面时必须提供视频 URL/ID 或 --space 主页")
+
+    args.platform = detect_platform(args.space or args.video, args.platform)
     session = args.session or os.getenv("COMMENTS_CATCHER_SESSION") or DEFAULT_SESSIONS[args.platform]
     args.session = session
 
@@ -1468,6 +1944,10 @@ def parse_and_validate_args(argv: list[str] | None = None) -> tuple[argparse.Nam
     args.jitter_range = float(
         _resolve_option(args.jitter_range, file_values, "jitter_range", DEFAULT_JITTER_RANGE)
     )
+    args.video_delay = float(
+        _resolve_option(args.video_delay, file_values, "video_delay", DEFAULT_VIDEO_DELAY)
+    )
+    args.dwell = float(_resolve_option(args.dwell, file_values, "dwell", DEFAULT_DWELL))
     validate_sub_rate(args.sub_rate)
 
     config = CollectorConfig(
@@ -1476,6 +1956,8 @@ def parse_and_validate_args(argv: list[str] | None = None) -> tuple[argparse.Nam
         session=session,
         delay=args.delay,
         jitter_range=args.jitter_range,
+        video_delay=args.video_delay,
+        dwell=args.dwell,
         include_user_identifiers=args.include_user_identifiers,
     )
     config.validate()
@@ -1491,6 +1973,9 @@ def run(argv: list[str] | None = None) -> int:
         result, code = bridge.health_check()
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return code
+
+    if args.space:
+        return run_space_batch(args, config, bridge)
 
     platform = config.platform
     video_id = extract_video_id(args.video, platform)
