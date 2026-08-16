@@ -109,8 +109,10 @@ Agent 会自动启动 WebBridge、打开目标视频、等待页面就绪并开�
 
 ~~~
 python <skill-root>/scripts/comments_catcher.py <VIDEO> \
-  --output <OUTPUT.json> --with-sub --delay 5
+  --output <OUTPUT.json> --with-sub
 ~~~
+
+节奏与抽样参数（间隔、抖动、抽样率、种子）默认读取技能目录的 config.json，只有需要临时覆盖时才在命令行追加 `--delay`、`--jitter-range`、`--sub-rate`、`--seed`。
 
 完整参数见 skills/comments-catcher/references/cli-reference.md；故障排查见 skills/comments-catcher/references/troubleshooting.md。
 

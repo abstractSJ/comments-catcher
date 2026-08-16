@@ -115,24 +115,24 @@ jobs:
 
           plugin = load_json(".claude-plugin/plugin.json")
           assert plugin.get("name") == "comments-catcher"
-          assert plugin.get("version") == "0.3.0"
+          assert plugin.get("version") == "0.4.0"
           assert plugin.get("license") == "MIT"
           assert plugin.get("skills") == "./skills/"
 
           codex_plugin = load_json(".codex-plugin/plugin.json")
           assert codex_plugin.get("name") == "comments-catcher"
-          assert codex_plugin.get("version") == "0.3.0"
+          assert codex_plugin.get("version") == "0.4.0"
           assert codex_plugin.get("license") == "MIT"
           assert codex_plugin.get("skills") == "./skills/"
 
           marketplace = load_json(".claude-plugin/marketplace.json")
           assert marketplace.get("name") == "comments-catcher"
-          assert marketplace.get("metadata", {}).get("version") == "0.3.0"
+          assert marketplace.get("metadata", {}).get("version") == "0.4.0"
           plugins = marketplace.get("plugins")
           assert isinstance(plugins, list) and len(plugins) == 1
           entry = plugins[0]
           assert entry.get("name") == "comments-catcher"
-          assert entry.get("version") == "0.3.0"
+          assert entry.get("version") == "0.4.0"
           assert entry.get("license") == "MIT"
           assert entry.get("source") == "./"
 
@@ -145,7 +145,7 @@ jobs:
           sample = {
               "meta": {
               "schema_version": "2.0.0",
-              "collector_version": "0.3.0",
+              "collector_version": "0.4.0",
               "platform": "douyin",
               "video_id": "0000000000000000000",
               "aweme_id": "0000000000000000000",

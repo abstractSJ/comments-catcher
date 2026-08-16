@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-COLLECTOR_VERSION = "0.3.0"
+COLLECTOR_VERSION = "0.4.0"
 SCHEMA_VERSION = "2.0.0"
 PLATFORM_AUTO = "auto"
 PLATFORM_DOUYIN = "douyin"
@@ -706,17 +706,38 @@ CONFIG_FILE_KEYS = {
 }
 
 
+def _validate_config_entry(key: str, value: Any, context: str) -> Any:
+    """
+    校验单个配置键值并返回规范化结果。
+
+    所有校验在任何网络请求之前完成；bool 会被显式拒绝，因为它是 int 的子类，
+    不拦截会把 ``"delay": true`` 悄悄当成 1 秒使用。
+    """
+    if key not in CONFIG_FILE_KEYS:
+        allowed = ", ".join(sorted(CONFIG_FILE_KEYS))
+        raise ConfigError(f"{context}包含不支持的键 {key!r}；允许的键：{allowed}")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"配置项 {key} 必须是数值，当前为 {value!r}")
+    if key == "seed":
+        if isinstance(value, float) and not value.is_integer():
+            raise ConfigError("配置项 seed 必须是整数")
+        value = int(value)
+    return value
+
+
 def load_config_file(path: Path) -> dict[str, Any]:
     """
-    读取技能本地 config.json，只接受白名单内的数值键。
+    读取技能本地 config.json，支持顶层通用键与 douyin/bilibili 平台专属小节。
 
-    配置文件用于长期调控采集节奏与抽样参数；任何解析或类型错误都必须在产生
-    网络请求之前暴露，因此这里直接抛出 ConfigError 而不是回退默认值。
+    顶层写通用配置；与平台同名的小节（``"douyin": {...}``）只写需要对该平台
+    覆盖的键。任何解析或类型错误都必须在产生网络请求之前暴露，因此这里直接
+    抛出 ConfigError 而不是回退默认值。
 
     参数：
         path: config.json 的路径，调用方需先确认文件存在。
     返回：
-        键为白名单参数名、值为 int/float 的字典；以 "_" 开头的注释键会被忽略。
+        字典；平台小节键映射到子字典，其余为 int/float 标量。
+        以 "_" 开头的注释键（含小节内部）会被忽略。
     """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -729,16 +750,19 @@ def load_config_file(path: Path) -> dict[str, Any]:
     for key, value in raw.items():
         if key.startswith("_"):
             continue
-        if key not in CONFIG_FILE_KEYS:
-            allowed = ", ".join(sorted(CONFIG_FILE_KEYS))
-            raise ConfigError(f"配置文件包含不支持的键 {key!r}；允许的键：{allowed}")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ConfigError(f"配置项 {key} 必须是数值，当前为 {value!r}")
-        if key == "seed":
-            if isinstance(value, float) and not value.is_integer():
-                raise ConfigError("配置项 seed 必须是整数")
-            value = int(value)
-        values[key] = value
+        if key in SUPPORTED_PLATFORMS:
+            if not isinstance(value, dict):
+                raise ConfigError(f"平台小节 {key!r} 必须是 JSON 对象")
+            section: dict[str, Any] = {}
+            for sub_key, sub_value in value.items():
+                if sub_key.startswith("_"):
+                    continue
+                section[sub_key] = _validate_config_entry(
+                    sub_key, sub_value, f"平台小节 {key!r} "
+                )
+            values[key] = section
+            continue
+        values[key] = _validate_config_entry(key, value, "配置文件")
     return values
 
 
@@ -759,8 +783,25 @@ def resolve_config_path(explicit: str | None) -> Path | None:
     return None
 
 
+def merge_platform_config(file_values: dict[str, Any], platform: str) -> dict[str, Any]:
+    """
+    把顶层通用配置与指定平台的小节合并；平台小节中的键覆盖顶层同名键。
+
+    参数：
+        file_values: load_config_file 的返回结果。
+        platform: 目标平台（douyin 或 bilibili）。
+    返回：
+        只含标量键的字典，供 _resolve_option 查询。
+    """
+    merged = {k: v for k, v in file_values.items() if k not in SUPPORTED_PLATFORMS}
+    section = file_values.get(platform)
+    if isinstance(section, dict):
+        merged.update(section)
+    return merged
+
+
 def _resolve_option(cli_value, file_values: dict[str, Any], key: str, default):
-    """按“命令行参数 > config.json > 内置默认”的优先级解析单个参数。"""
+    """按“命令行参数 > 平台小节 > 顶层通用配置 > 内置默认”的优先级解析单个参数。"""
     if cli_value is not None:
         return cli_value
     if key in file_values:
@@ -1413,9 +1454,13 @@ def parse_and_validate_args(argv: list[str] | None = None) -> tuple[argparse.Nam
     args.session = session
 
     # 先合成节奏与抽样参数再验证，保证配置文件里的非法值与命令行非法值一样
-    # 在发起任何网络请求之前被拒绝。
+    # 在发起任何网络请求之前被拒绝。平台已确定，按“平台小节覆盖顶层通用”合并配置。
     config_path = resolve_config_path(args.config)
-    file_values = load_config_file(config_path) if config_path else {}
+    file_values = (
+        merge_platform_config(load_config_file(config_path), args.platform)
+        if config_path
+        else {}
+    )
     args.config_source = str(config_path) if config_path else None
     args.sub_rate = float(_resolve_option(args.sub_rate, file_values, "sub_rate", DEFAULT_SUB_RATE))
     args.seed = int(_resolve_option(args.seed, file_values, "seed", DEFAULT_SEED))

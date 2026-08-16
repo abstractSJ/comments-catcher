@@ -39,9 +39,20 @@ python comments_catcher.py [VIDEO] [OPTIONS]
 
 ## 本地配置文件 config.json
 
-节奏与抽样参数按“命令行参数 > `config.json` > 内置默认”的优先级合成。未使用 `--config` 时，采集器自动读取技能目录（`scripts/` 上一级）下的 `config.json`；文件不存在时全部使用内置默认。
+节奏与抽样参数按“命令行参数 > 平台专属小节 > 顶层通用配置 > 内置默认”的优先级合成。未使用 `--config` 时，采集器自动读取技能目录（`scripts/` 上一级）下的 `config.json`；文件不存在时全部使用内置默认。
 
-支持的键：
+顶层写两个平台通用的值；`"douyin"` / `"bilibili"` 小节只写该平台需要覆盖的键，省略的键沿用顶层，例如：
+
+```json
+{
+  "delay": 3.0,
+  "sub_rate": 0.5,
+  "douyin": { "delay": 5.0 },
+  "bilibili": { "sub_rate": 1.0 }
+}
+```
+
+支持的键（顶层与平台小节相同）：
 
 | 键 | 类型 | 内置默认 | 说明 |
 |---|---|---:|---|
@@ -65,13 +76,15 @@ python comments_catcher.py [VIDEO] [OPTIONS]
 
 ## 示例
 
+示例刻意不带 `--delay`、`--jitter-range`、`--sub-rate`、`--seed`，使 `config.json` 中的用户配置生效；仅当需要临时覆盖配置时才追加这些参数。
+
 抖音：
 
 ```bash
 python ./skills/comments-catcher/scripts/comments_catcher.py \
   "https://www.douyin.com/video/0000000000000000000" \
   --platform douyin --output ./douyin-comments.json \
-  --with-sub --delay 5 --sub-rate 0.5 --seed 42
+  --with-sub
 ```
 
 B 站：
@@ -81,7 +94,7 @@ python ./skills/comments-catcher/scripts/comments_catcher.py \
   "https://www.bilibili.com/video/BV1qnuq6dEga" \
   --platform bilibili --session bili-comments \
   --output ./bilibili-comments.json \
-  --with-sub --delay 5 --sub-rate 0.5 --seed 42
+  --with-sub
 ```
 
 单独打开并预检两个平台页面：

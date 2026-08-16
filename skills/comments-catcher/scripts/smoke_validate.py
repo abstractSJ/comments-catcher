@@ -115,16 +115,19 @@ def offline_check() -> dict:
         raise RuntimeError("skill 包含 Python 缓存目录：" + ", ".join(map(str, cache_dirs)))
     schema = validate_json_file(SKILL_DIR / "references" / "output-schema-v2.json")
     module = load_collector()
-    # config.json 是发布包的一部分，其取值必须与采集器校验规则保持一致。
+    # config.json 是发布包的一部分，其顶层键与平台小节都必须通过采集器校验规则。
     config_values = module.load_config_file(SKILL_DIR / "config.json")
-    probe = module.CollectorConfig(
-        delay=float(config_values.get("delay", module.DEFAULT_DELAY)),
-        jitter_range=float(config_values.get("jitter_range", module.DEFAULT_JITTER_RANGE)),
-    )
-    probe.validate()
-    module.validate_sub_rate(float(config_values.get("sub_rate", module.DEFAULT_SUB_RATE)))
-    if not isinstance(config_values.get("seed", module.DEFAULT_SEED), int):
-        raise RuntimeError("config.json 的 seed 必须是整数")
+    for platform in (module.PLATFORM_DOUYIN, module.PLATFORM_BILIBILI):
+        merged = module.merge_platform_config(config_values, platform)
+        probe = module.CollectorConfig(
+            platform=platform,
+            delay=float(merged.get("delay", module.DEFAULT_DELAY)),
+            jitter_range=float(merged.get("jitter_range", module.DEFAULT_JITTER_RANGE)),
+        )
+        probe.validate()
+        module.validate_sub_rate(float(merged.get("sub_rate", module.DEFAULT_SUB_RATE)))
+        if not isinstance(merged.get("seed", module.DEFAULT_SEED), int):
+            raise RuntimeError(f"config.json 的 {platform} 平台 seed 必须是整数")
     version_output = run_command([sys.executable, str(COLLECTOR), "--version"])
     run_command([sys.executable, str(COLLECTOR), "--help"])
 

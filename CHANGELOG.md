@@ -12,6 +12,16 @@
 - 修复输出 Schema、技能说明、README 与 CI 样例之间的字段漂移。
 - 安装时排除 Python 缓存，避免把本地运行产物带入 skill 包。
 
+## [0.4.0] - 2026-08-17
+
+### Added
+
+- `config.json` 支持 `douyin`/`bilibili` 平台专属小节，只需写该平台要覆盖的键，省略的键沿用顶层通用配置；优先级为命令行参数 > 平台小节 > 顶层通用 > 内置默认。
+
+### Fixed
+
+- 修正 SKILL.md 与参考文档的示例和表述：Agent 在用户未明确要求时不得携带 `--delay`/`--jitter-range`/`--sub-rate`/`--seed`，避免照抄示例参数静默覆盖 config.json 中的用户配置。
+
 ## [0.3.0] - 2026-08-17
 
 ### Added

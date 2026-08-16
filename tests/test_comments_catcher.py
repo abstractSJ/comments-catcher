@@ -268,6 +268,67 @@ class ConfigFileTests(unittest.TestCase):
                     ["--health-check", "--config", str(self.config_path)]
                 )
 
+    def test_platform_sections_override_top_level(self):
+        self._write(
+            {
+                "delay": 5.0,
+                "sub_rate": 0.5,
+                "douyin": {"delay": 3.0},
+                "bilibili": {"delay": 8.0, "seed": 7},
+            }
+        )
+        # 抖音：delay 读平台小节，sub_rate 回落顶层通用值。
+        args, config = cc.parse_and_validate_args(
+            ["--health-check", "--platform", "douyin", "--config", str(self.config_path)]
+        )
+        self.assertEqual(config.delay, 3.0)
+        self.assertEqual(args.sub_rate, 0.5)
+
+        # B 站：delay 与 seed 都读平台小节。
+        args, config = cc.parse_and_validate_args(
+            ["--health-check", "--platform", "bilibili", "--config", str(self.config_path)]
+        )
+        self.assertEqual(config.delay, 8.0)
+        self.assertEqual(args.seed, 7)
+
+        # 命令行参数仍然优先于平台小节。
+        args, config = cc.parse_and_validate_args(
+            [
+                "--health-check",
+                "--platform",
+                "bilibili",
+                "--delay",
+                "4.0",
+                "--config",
+                str(self.config_path),
+            ]
+        )
+        self.assertEqual(config.delay, 4.0)
+
+    def test_platform_section_invalid_content_rejected(self):
+        with self.assertRaises(cc.ConfigError):
+            cc.load_config_file(self._write({"douyin": {"dealy": 3}}))
+        with self.assertRaises(cc.ConfigError):
+            cc.load_config_file(self._write({"douyin": 5}))
+        with self.assertRaises(cc.ConfigError):
+            cc.load_config_file(self._write({"bilibili": {"delay": "slow"}}))
+        self._write({"douyin": {"delay": 1.0}})
+        with self.assertRaises(cc.ConfigError):
+            cc.parse_and_validate_args(
+                ["--health-check", "--platform", "douyin", "--config", str(self.config_path)]
+            )
+
+    def test_merge_platform_config_ignores_other_platform(self):
+        values = {
+            "delay": 5.0,
+            "douyin": {"delay": 3.0},
+            "bilibili": {"delay": 8.0},
+        }
+        douyin = cc.merge_platform_config(values, cc.PLATFORM_DOUYIN)
+        bilibili = cc.merge_platform_config(values, cc.PLATFORM_BILIBILI)
+        self.assertEqual(douyin, {"delay": 3.0})
+        self.assertEqual(bilibili, {"delay": 8.0})
+
     def test_jitter_range_bounds(self):
         with self.assertRaises(cc.ConfigError):
             cc.CollectorConfig(jitter_range=-0.1).validate()
