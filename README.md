@@ -1,131 +1,138 @@
 # comments-catcher
 
-一个可同时供 Codex 与 Claude Code 发现的抖音 / B 站公开评论采集 skill。规范运行单元只有：
+用 Codex 或 Claude Code 采集抖音、B 站视频的公开评论。
 
-```text
-skills/comments-catcher/
-├── SKILL.md
-├── agents/openai.yaml
-├── scripts/
-│   ├── comments_catcher.py
-│   └── smoke_validate.py
-└── references/
-```
+支持一级评论、按比例抽样回复、断点续采和 JSON/CSV 导出。
 
-`.claude-plugin/` 和 `.codex-plugin/` 是宿主插件入口；直接复制或运行安装器时，不需要修改 skill 内容，也不依赖当前工作目录。
+## 快速开始
 
-## 支持平台
+### 1. 准备环境
 
-- 抖音：视频 URL、`aweme_id`，默认会话 `douyin`。
-- B 站：视频 URL、BV 号、av 号，默认会话 `bili-comments`。
-- `--platform auto` 会按输入自动识别，也可以显式指定平台。
-- Agent 会通过 WebBridge 自动启动 daemon（若未运行）并打开目标视频；只复用浏览器已有登录状态，不接收 Cookie、令牌或认证请求头。
+只需要准备：
 
-## 为什么 Codex 和 Claude Code 可以共用
+- Python 3.10 或更高版本；
+- 已安装 Kimi WebBridge 浏览器扩展/daemon；
+- 在浏览器中登录对应的抖音或 B 站账号一次。
 
-skill 的通用格式是一个包含 `SKILL.md` 的目录，frontmatter 只保留 `name` 和 `description`。本项目的采集脚本、引用资料和 `agents/openai.yaml` 都放在同一目录内。
+不需要 API Key、Cookie、requests、Node.js 或 yt-dlp。
 
-在当前机器上，`C:\Users\1\.claude\skills` 是指向 `C:\Users\1\.agents\skills` 的 Junction，因此两个宿主实际读取的是同一份文件。安装器的 `Auto` 模式会识别这种共享目录并只安装一份；如果目标机器的两个目录彼此独立，则自动安装到两边。
+### 2. 下载项目
 
-## 前置条件
+有 Git：
 
-- Python 3.10 或更高版本。
-- 已安装并可连接浏览器的 Kimi WebBridge 扩展；采集器会尝试自动启动 daemon。
-- 对应平台的登录状态可用；只有登录失效或出现 CAPTCHA 时才需要用户手动处理。
-- 输出目录可写。
+~~~
+git clone https://github.com/abstractSJ/comments-catcher.git
+cd comments-catcher
+~~~
 
-项目只复用已有会话，不接收 Cookie、令牌或认证请求头。Agent 会自动导航，登录失效或 CAPTCHA 才需要用户在同一个可见会话中手动处理。
+没有 Git：在 GitHub 页面点击 **Code → Download ZIP**，解压后进入项目目录。
 
-## 安装
+### 3. 安装 skill
 
-### Windows
+Windows PowerShell：
 
-用户级自动安装：
-
-```powershell
+~~~
 .\install.ps1 -Scope User -Target Auto
-```
+~~~
 
-项目级自动安装：
+如果 PowerShell 阻止执行本地脚本：
 
-```powershell
-.\install.ps1 -Scope Project -ProjectPath "D:\path\to\project" -Target Auto
-```
+~~~
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Scope User -Target Auto
+~~~
 
-目标已存在时才使用 `-Force`。安装器只复制本地 `skills/comments-catcher`，不会联网或执行远程脚本。
+macOS / Linux：
 
-### macOS / Linux
-
-```bash
+~~~
 chmod +x ./install.sh
 ./install.sh --scope user --target auto
-```
+~~~
 
-### 直接复制
+安装器会把 skill 放到 Codex 和 Claude Code 能发现的位置。安装后重启或刷新对应的 Agent。
 
-把完整的 `skills/comments-catcher` 目录复制为以下任一位置：
+### 4. 直接告诉 Agent 要采集什么
 
-```text
-用户级 Codex：   ~/.agents/skills/comments-catcher
-用户级 Claude：  ~/.claude/skills/comments-catcher
-项目级 Codex：   <project>/.agents/skills/comments-catcher
-项目级 Claude：  <project>/.claude/skills/comments-catcher
-```
+不需要用户先打开视频页面，也不需要手动运行 Python。直接发送类似请求：
 
-如果两个宿主目录是同一个 Junction/符号链接，只复制一次即可。不要只复制 `SKILL.md`。
+~~~
+请使用 comments-catcher 采集这个 B 站视频的公开评论：
+https://www.bilibili.com/video/BVxxxx
 
-## 使用
+保存为 D:/output/bilibili-comments.json，
+采集一级评论，并按默认设置抽样回复。
+~~~
 
-正常采集时不需要用户预先打开页面，直接传入视频 URL/ID，采集器会自动导航。需要单独预检时：
+抖音示例：
 
-```bash
-python <skill-root>/scripts/comments_catcher.py \
-  "https://www.douyin.com/video/0000000000000000000" \
-  --platform douyin --prepare-page
-python <skill-root>/scripts/comments_catcher.py \
-  "https://www.bilibili.com/video/BV1qnuq6dEga" \
-  --platform bilibili --prepare-page
-```
+~~~
+请使用 comments-catcher 采集这个抖音视频的公开评论：
+https://www.douyin.com/video/1234567890123456789
 
-抖音：
+保存为 D:/output/douyin-comments.json。
+~~~
 
-```bash
-python <skill-root>/scripts/comments_catcher.py \
-  "https://www.douyin.com/video/0000000000000000000" \
-  --platform douyin --output ./outputs/douyin.json \
-  --with-sub --delay 5 --sub-rate 0.5 --seed 42
-```
+Agent 会自动启动 WebBridge、打开目标视频、等待页面就绪并开始采集。
 
-B 站：
+### 5. 只有以下情况需要用户介入
 
-```bash
-python <skill-root>/scripts/comments_catcher.py \
-  "https://www.bilibili.com/video/BV1qnuq6dEga" \
-  --platform bilibili --session bili-comments \
-  --output ./outputs/bilibili.json \
-  --with-sub --delay 5 --sub-rate 0.5 --seed 42
-```
+- 第一次登录或登录状态失效：在 Agent 打开的可见浏览器页面中登录；
+- 页面出现 CAPTCHA：用户手动完成后告诉 Agent 重试；
+- WebBridge 扩展未安装、未连接或版本过旧。
 
-`<skill-root>` 必须是实际加载的 skill 目录，不要用当前工作目录猜测。完整参数见 [`skills/comments-catcher/references/cli-reference.md`](skills/comments-catcher/references/cli-reference.md)。
+其他情况下不需要用户手动打开页面。
 
-## 输出
+## 支持的输入
 
-新输出使用 v2 Schema，包含通用的 `meta.platform`、`meta.video_id`、计数、游标、完成状态、抽样率和种子；抖音额外保存 `aweme_id`，B 站额外保存 `bvid` 和页面读取到的 `oid`。`comments` 是一级评论，`subs` 是可选的回复线程。
+- 抖音：视频 URL 或 aweme_id；
+- B 站：完整视频 URL、BV 号或 av 号；
+- b23.tv 短链：请提供展开后的完整 URL、BV 号或 av 号。
 
-`all_count` 是平台接口报告的总数，可能包含一级评论和回复；`main_complete=false` 或 `last_has_more=1` 时，不能把结果描述为全量完成。
+平台通常会自动识别，也可以让 Agent 显式指定抖音或 B 站。
 
-## 校验
+## 输出与断点续采
 
-```bash
-python skills/comments-catcher/scripts/smoke_validate.py
-python -m unittest discover -s tests -p "test*.py"
-```
+- 默认输出 JSON，可额外要求 CSV；
+- 使用相同的视频和输出路径再次执行，会从已有进度继续；
+- meta.main_complete=false 或 meta.last_has_more=1 时，结果可能还没有采集完；
+- 默认抽样部分有回复的一级评论线程；需要全部命中线程时，可以明确要求回复抽样比例为 100%。
 
 ## 安全边界
 
-- 只采集用户可见的公开评论。
-- 不绕过登录、权限、地区限制、风控或速率限制。
-- 不轮换代理、伪造指纹、逆向签名或自动处理 CAPTCHA。
-- 输出与日志不得包含 Cookie、令牌、认证头或浏览器存储。
+- 只采集用户可见的公开评论；
+- 不读取、导出或要求提供 Cookie、Token、密码或认证请求头；
+- 不绕过登录、权限、验证码、风控或速率限制；
+- 不轮换代理、伪造指纹或逆向平台签名。
 
-详见 [`skills/comments-catcher/references/safety-privacy.md`](skills/comments-catcher/references/safety-privacy.md)。
+## 手动运行脚本（可选）
+
+一般不需要手动运行。排查问题或编写自动化流程时，可以直接调用：
+
+~~~
+python <skill-root>/scripts/comments_catcher.py <VIDEO> \
+  --output <OUTPUT.json> --with-sub --delay 5
+~~~
+
+完整参数见 skills/comments-catcher/references/cli-reference.md；故障排查见 skills/comments-catcher/references/troubleshooting.md。
+
+## 项目结构
+
+~~~
+skills/comments-catcher/
+├── SKILL.md                         # Agent 使用说明
+├── scripts/comments_catcher.py      # 采集程序
+├── scripts/smoke_validate.py        # 安装校验
+└── references/                      # 参数、输出格式和故障排查
+~~~
+
+根目录的安装器、插件清单和测试文件用于发布与维护；实际被 Agent 加载的是 skills/comments-catcher/。
+
+## 开发者校验
+
+~~~
+python skills/comments-catcher/scripts/smoke_validate.py
+python -m unittest discover -s tests -p "test*.py"
+~~~
+
+## License
+
+MIT
