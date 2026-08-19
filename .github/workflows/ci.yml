@@ -115,24 +115,27 @@ jobs:
 
           plugin = load_json(".claude-plugin/plugin.json")
           assert plugin.get("name") == "comments-catcher"
-          assert plugin.get("version") == "0.5.1"
+          # 以主插件清单为发布版本来源，避免每次发版还要同步修改 CI 内的硬编码版本。
+          expected_version = plugin.get("version")
+          assert isinstance(expected_version, str)
+          assert re.fullmatch(r"\d+\.\d+\.\d+", expected_version)
           assert plugin.get("license") == "MIT"
           assert plugin.get("skills") == "./skills/"
 
           codex_plugin = load_json(".codex-plugin/plugin.json")
           assert codex_plugin.get("name") == "comments-catcher"
-          assert codex_plugin.get("version") == "0.5.1"
+          assert codex_plugin.get("version") == expected_version
           assert codex_plugin.get("license") == "MIT"
           assert codex_plugin.get("skills") == "./skills/"
 
           marketplace = load_json(".claude-plugin/marketplace.json")
           assert marketplace.get("name") == "comments-catcher"
-          assert marketplace.get("metadata", {}).get("version") == "0.5.1"
+          assert marketplace.get("metadata", {}).get("version") == expected_version
           plugins = marketplace.get("plugins")
           assert isinstance(plugins, list) and len(plugins) == 1
           entry = plugins[0]
           assert entry.get("name") == "comments-catcher"
-          assert entry.get("version") == "0.5.1"
+          assert entry.get("version") == expected_version
           assert entry.get("license") == "MIT"
           assert entry.get("source") == "./"
 
@@ -145,7 +148,7 @@ jobs:
           sample = {
               "meta": {
               "schema_version": "2.0.0",
-              "collector_version": "0.5.1",
+              "collector_version": expected_version,
               "platform": "douyin",
               "video_id": "0000000000000000000",
               "aweme_id": "0000000000000000000",
