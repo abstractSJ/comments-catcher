@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:comments-catcher:output-schema:v2",
   "title": "Comments Catcher Output Schema v2",
-  "description": "comments-catcher 0.2.x 的双平台结构化评论与恢复状态输出。",
+  "description": "comments-catcher 0.7.x 的双平台结构化评论与恢复状态输出。",
   "type": "object",
   "required": ["meta", "comments"],
   "properties": {
@@ -98,6 +98,11 @@
       "properties": {
         "cid": {"type": "string", "minLength": 1},
         "text": {"type": "string"},
+        "images": {
+          "type": "array",
+          "description": "评论附带的图片；文字与图片分别保留，多图保持平台返回顺序。",
+          "items": {"$ref": "#/$defs/image"}
+        },
         "create_time": {"type": ["integer", "string", "null"]},
         "digg_count": {"type": "integer", "minimum": 0},
         "reply_comment_total": {"type": "integer", "minimum": 0},
@@ -111,6 +116,16 @@
         "is_author_digged": {"type": "integer", "minimum": 0}
       },
       "additionalProperties": true
+    },
+    "image": {
+      "type": "object",
+      "required": ["url", "width", "height"],
+      "properties": {
+        "url": {"type": "string", "pattern": "^https?://"},
+        "width": {"type": ["integer", "null"], "minimum": 1},
+        "height": {"type": ["integer", "null"], "minimum": 1}
+      },
+      "additionalProperties": false
     }
   }
 }

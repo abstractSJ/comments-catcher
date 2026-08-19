@@ -4,8 +4,16 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-19
+
+### Added
+
+- 抖音与 B 站的一级、二级评论统一保存 `images` 数组，保留图片 URL、宽高和多图顺序；CSV 使用 JSON 数组字符串导出图片信息。
+- B 站单视频与批量模式支持 `--with-transcript`，输出带时间轴的 JSON/TXT 平台字幕文稿；无字幕与字幕失败不影响评论主流程。
+
 ### Changed
 
+- 任务开始时幂等启动 WebBridge daemon，并在导航前有限等待浏览器扩展完成冷启动连接。
 - 将规范 skill 目录改为 Codex 与 Claude Code 可共用的通用格式。
 - 增加 `.codex-plugin/plugin.json` 与 Codex UI 元数据。
 - 安装器支持共享目录自动识别、两套原生目录回退和显式目标目录。

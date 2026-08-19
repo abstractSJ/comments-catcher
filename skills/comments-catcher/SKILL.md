@@ -1,6 +1,6 @@
 ---
 name: comments-catcher
-description: 使用用户现有、已登录的 WebBridge 浏览器会话采集抖音或哔哩哔哩视频的公开评论，支持一级评论、可复现抽样的回复线程、断点续采、博主主页按发布时间新→旧批量采集多个视频和 JSON/CSV 导出；当用户要求获取、导出、抽样或整理抖音/B站评论，或批量拉取某个 UP 主/博主多个视频的评论时使用。
+description: 使用用户现有、已登录的 WebBridge 浏览器会话采集抖音或哔哩哔哩视频的公开评论与评论图片，可选获取 B 站字幕文稿，支持回复抽样、断点续采、博主主页批量模式和 JSON/CSV 导出；当用户要求获取、导出、抽样或整理抖音/B站评论，批量拉取博主视频评论，或连同 B 站字幕一起采集时使用。
 ---
 
 # Comments Catcher
@@ -13,7 +13,7 @@ description: 使用用户现有、已登录的 WebBridge 浏览器会话采集�
 - B 站：`https://www.bilibili.com/video/BV...`、`av...` 或 BV/av 标识；默认 WebBridge 会话为 `bili-comments`。
 - 博主主页批量模式：`--space` 接受 B 站 `https://space.bilibili.com/<mid>` 或抖音 `https://www.douyin.com/user/<sec_uid>` 主页链接，按发布时间新→旧串行采集该博主多个视频的评论，详见下方“博主主页批量流程”。
 - 省略 `--platform` 时根据 URL/ID 自动识别；也可显式使用 `--platform douyin` 或 `--platform bilibili`。
-- Agent 会通过 WebBridge 自动启动 daemon（若尚未运行）、打开目标视频并等待页面就绪；用户不需要预先打开页面。只有页面要求登录或 CAPTCHA 时，才请用户在同一个可见会话中手动处理。会话名可用 `--session` 覆盖。
+- 采集器会先幂等启动 WebBridge daemon，再用无页面副作用的 `list_tabs` 探测等待浏览器扩展连接，然后打开目标视频并等待页面就绪；用户不需要预先打开页面。只有有限重试后扩展仍未连接，或页面要求登录/CAPTCHA 时，才请用户处理。会话名可用 `--session` 覆盖。
 
 ## 安全边界
 
@@ -26,8 +26,8 @@ description: 使用用户现有、已登录的 WebBridge 浏览器会话采集�
 
 1. 从请求中提取平台、视频 URL/ID、输出路径、一级评论页数上限、等待间隔、随机抖动幅度、回复抽样率和种子。
 2. **用户没有明确要求节奏或抽样参数时，禁止在命令行传入 `--delay`、`--jitter-range`、`--sub-rate`、`--seed`**。省略这些参数，采集器才会自动读取技能目录 `config.json` 中的用户配置（文件不存在时才用内置默认）；一旦在命令行写出这些参数，用户的 config.json 配置就会被覆盖。只有用户明确提出要求（例如"间隔放慢到 8 秒"、"要全部回复"）时，才传入对应参数。实现允许的最小基础间隔是 3 秒；用户要求更慢时照做。
-3. 正常采集直接调用同一技能目录中的 `comments_catcher.py`；采集器会自动启动 WebBridge、导航到目标视频、等待页面初始化并执行只读验证。不要要求用户预先打开页面。
-4. 如果需要分步预检，可先调用 `comments_catcher.py <VIDEO> --platform <platform> --prepare-page`；它会由 Agent 自动打开页面后退出，再继续正式采集。不要在导航前单独把 `--health-check` 当作页面打开步骤。
+3. 正常采集直接调用同一技能目录中的 `comments_catcher.py`。固定启动链路为：**幂等启动 daemon → `list_tabs` 轻量探测并有限等待扩展连接 → 导航目标视频 → 等待页面初始化 → 只读验证 → 采集**。`no extension connected` 在等待窗口内属于可重试的冷启动状态，禁止第一次出现时立刻打断用户；只有采集器完成有限重试后仍失败，才提示用户启用扩展。不要要求用户预先打开页面，也不要另行手工拼接 Cookie 或认证请求。
+4. 如果需要分步预检，可先调用 `comments_catcher.py <VIDEO> --platform <platform> --prepare-page`；它复用上述完整启动链路，自动打开页面后退出，再继续正式采集。不要在导航前单独把 `--health-check` 当作页面打开步骤。
 5. 用绝对脚本路径和参数数组调用采集器。标准调用**只带**平台、会话、输出路径和 `--with-sub`，不带任何节奏/抽样参数：
 
    ```text
@@ -61,15 +61,25 @@ description: 使用用户现有、已登录的 WebBridge 浏览器会话采集�
 5. 断点分两层：`<OUTPUT_DIR>/video_list.json` 记录每个视频的 done/failed 状态，重跑同一命令自动跳过已完成视频；每个视频的 `<video_id>.json` 仍保留页级断点，某个视频采到一半中断可精确续跑。中途中止后让用户重跑同一条命令即可。
 6. `--output`、`--csv`、`--prepare-page`、`--reuse-current-page`、`--subs-only` 仅用于单视频模式，不能与 `--space` 同用。
 
+## B 站字幕文稿（--with-transcript）
+
+用户要求"连视频内容一起要 / 要视频文稿 / 字幕 / 视频转文字"时，在采集命令上追加 `--with-transcript`；用户没要求时不要自行添加。它是功能开关而非节奏参数，不受节奏参数禁令约束。
+
+- 仅 B 站有效：B 站视频大多带有平台离线生成的 AI 字幕或 UP 主上传的 CC 字幕，属纯接口数据，与评论一样一次拉全量，不需要播放视频；抖音无同类开放字幕轨道，会提示跳过。
+- 输出与评论 JSON 同目录：`<视频ID>_transcript.json`（带时间轴的结构化数据）与 `<视频ID>_transcript.txt`（带 `[mm:ss]` 时间戳的可读文稿）。
+- 无字幕轨道的视频标记 `no_subtitle` 并跳过，不算失败；覆盖率并非 100%，缺失集中在超短视频、音乐类与版权内容。
+- 字幕获取是 best-effort：接口失败只告警，绝不影响评论采集主流程与退出码。
+- 批量模式同样支持：字幕状态（done/no_subtitle/failed）记入 `video_list.json` 每个视频条目；对历史已完成任务重跑同一命令并加上 `--with-transcript`，会对已完成视频只补采字幕。
+
 ## 输出检查
 
 当前 v2 输出的 `meta` 字段包括：
 
 `schema_version`、`collector_version`、`platform`、`video_id`、平台专属的 `aweme_id`/`bvid`、可用时的 B 站 `oid`、`all_count`、`fetched_count`、`sub_count`、`total_count`、`last_cursor`、`last_has_more`、`main_complete`、`main_page_count`、`sub_rate`、`seed`、`with_sub`、`sampled_cids`、`skipped_cids`、`sub_done_cids`、`updated_at`。
 
-`comments` 是统一字段的一级评论数组；`subs`（存在时）是 `[[root_cid, comments_array], ...]`。`all_count` 是平台接口报告的总数，可能包含一级评论和回复，不得直接当作已抓取的一级评论数。`main_complete=false` 或 `last_has_more=1` 时，不得把结果描述为全量完成。
+`comments` 是统一字段的一级评论数组；评论图片保存在 `images` 数组中，每项包含可直接读取的 `url` 与可用时的宽高，文字仍独立保存在 `text`。`subs`（存在时）是 `[[root_cid, comments_array], ...]`。`all_count` 是平台接口报告的总数，可能包含一级评论和回复，不得直接当作已抓取的一级评论数。`main_complete=false` 或 `last_has_more=1` 时，不得把结果描述为全量完成。
 
-交付时报告输出路径、平台、视频 ID、一级评论数、回复数、抽样线程数、完成状态、最终游标、实际抽样率和种子；不得报告认证材料。
+交付时报告输出路径、平台、视频 ID、一级评论数、回复数、抽样线程数、完成状态、最终游标、实际抽样率和种子；启用 `--with-transcript` 时同时报告字幕文稿路径与无字幕视频数；不得报告认证材料。
 
 ## 本地配置
 

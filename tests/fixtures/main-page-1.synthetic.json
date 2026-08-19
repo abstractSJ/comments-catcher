@@ -4,6 +4,13 @@
     {
       "cid": "7000000000000000001",
       "text": "合成一级评论 A",
+      "images": [
+        {
+          "url": "https://example.invalid/comment-a.jpg",
+          "width": 1080,
+          "height": 1440
+        }
+      ],
       "create_time": 1700000001,
       "digg_count": 10,
       "reply_comment_total": 2,
@@ -19,6 +26,7 @@
     {
       "cid": "7000000000000000002",
       "text": "合成一级评论 B",
+      "images": [],
       "create_time": 1700000002,
       "digg_count": 5,
       "reply_comment_total": 0,

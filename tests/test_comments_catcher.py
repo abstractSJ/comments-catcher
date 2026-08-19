@@ -458,6 +458,14 @@ class StateAndCollectorTests(unittest.TestCase):
         self.assertEqual(loaded["meta"]["last_has_more"], 0)
         self.assertTrue(loaded["meta"]["main_complete"])
         self.assertEqual(len(loaded["subs"]["7000000000000000001"]), 2)
+        self.assertEqual(
+            loaded["comments"][0]["images"][0]["url"],
+            "https://example.invalid/comment-a.jpg",
+        )
+        self.assertEqual(
+            loaded["subs"]["7000000000000000001"][0]["images"][0]["url"],
+            "https://example.invalid/reply-a.webp",
+        )
 
     def test_resume_rejects_different_video_or_sampling_settings(self):
         state = cc.new_state("7674214863132396011", 0.5, 42, True)
@@ -507,6 +515,28 @@ class StateAndCollectorTests(unittest.TestCase):
         self.assertEqual(len(rows), 4)
         self.assertEqual(sum(row["is_sub"] == "0" for row in rows), 2)
         self.assertEqual(sum(row["is_sub"] == "1" for row in rows), 2)
+        self.assertEqual(
+            json.loads(rows[0]["images"])[0]["url"],
+            "https://example.invalid/comment-a.jpg",
+        )
+        self.assertEqual(json.loads(rows[1]["images"]), [])
+        self.assertEqual(
+            json.loads(rows[2]["images"])[0]["url"],
+            "https://example.invalid/reply-a.webp",
+        )
+
+    def test_output_schema_declares_comment_images(self):
+        schema_path = (
+            ROOT
+            / "skills"
+            / "comments-catcher"
+            / "references"
+            / "output-schema-v2.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        image_property = schema["$defs"]["comment"]["properties"]["images"]
+        self.assertEqual(image_property["items"]["$ref"], "#/$defs/image")
+        self.assertEqual(schema["$defs"]["image"]["required"], ["url", "width", "height"])
 
     def test_bilibili_pagination_resume_and_sub_cursor(self):
         bridge = FakeBilibiliBridge()
@@ -550,6 +580,7 @@ class FakeSpaceBridge:
         self.fail_on = set(fail_on)
         self.prepared_pages: list[str] = []
         self.browse_calls = 0
+        self.transcript_calls: list[str] = []
         self.space_url: str | None = None
 
     def prepare_space_page(self, space_url: str) -> None:
@@ -593,6 +624,16 @@ class FakeSpaceBridge:
                 "total": 1,
             }
         raise AssertionError("测试未开启二级评论")
+
+    def fetch_bilibili_transcript(self, video_id: str) -> dict:
+        self.transcript_calls.append(video_id)
+        return {
+            "status": "ok",
+            "title": f"标题-{video_id}",
+            "lan": "ai-zh",
+            "lan_doc": "中文（自动生成）",
+            "lines": [{"from": 65.2, "to": 67.0, "content": "合成字幕"}],
+        }
 
 
 class SpaceModeTests(unittest.TestCase):
@@ -689,6 +730,23 @@ class SpaceModeTests(unittest.TestCase):
                 "https://www.bilibili.com/read/cv123", cc.PLATFORM_BILIBILI
             )
         )
+
+    def test_batch_with_transcript_saves_files_and_manifest_status(self):
+        bridge = FakeSpaceBridge(self.VIDEO_IDS)
+        args, config = self._space_args(["--with-transcript"])
+
+        with mock.patch.object(cc, "jittered_sleep"):
+            code = cc.run_space_batch(args, config, bridge)
+
+        self.assertEqual(code, cc.EXIT_OK)
+        self.assertEqual(bridge.transcript_calls, self.VIDEO_IDS)
+        manifest = self._manifest()
+        self.assertTrue(all(item["transcript"] == "done" for item in manifest["videos"]))
+        for video_id in self.VIDEO_IDS:
+            transcript_path = self.output_dir / f"{video_id}_transcript.json"
+            document = json.loads(transcript_path.read_text(encoding="utf-8"))
+            self.assertEqual(document["video_id"], video_id)
+            self.assertEqual(document["segments"][0]["content"], "合成字幕")
 
     def test_merge_space_videos_preserves_status_and_truncates(self):
         manifest = cc.new_space_manifest(
@@ -849,6 +907,35 @@ class CaptchaAndHealthTests(unittest.TestCase):
         client.eval_js = mock.Mock(return_value=result)
         return client
 
+    def test_douyin_fetch_includes_image_list_normalization(self):
+        client = cc.WebBridgeClient(
+            cc.CollectorConfig(platform=cc.PLATFORM_DOUYIN, delay=3.0)
+        )
+        client.eval_js = mock.Mock(
+            return_value={"code": 0, "comments": [], "cursor": 0, "has_more": 0, "total": 0}
+        )
+
+        client.fetch_json("comment/list", {"aweme_id": "1", "cursor": 0})
+
+        code = client.eval_js.call_args.args[0]
+        self.assertIn("comment.image_list", code)
+        self.assertIn("images: rawImages.map(normalizeImage)", code)
+
+    def test_bilibili_fetch_includes_picture_normalization(self):
+        client = cc.WebBridgeClient(
+            cc.CollectorConfig(platform=cc.PLATFORM_BILIBILI, delay=3.0)
+        )
+        client.oid = 123456
+        client.eval_js = mock.Mock(
+            return_value={"code": 0, "comments": [], "cursor": 1, "has_more": 0, "total": 0}
+        )
+
+        client.fetch_json("comment/list", {"next": 1})
+
+        code = client.eval_js.call_args.args[0]
+        self.assertIn("content.pictures", code)
+        self.assertIn("images: pictures.map(normalizeImage)", code)
+
     def test_captcha_three_states(self):
         self.assertEqual(self._client_with_result({"state": "clear"}).captcha_state(), "clear")
         self.assertEqual(self._client_with_result({"state": "visible"}).captcha_state(), "visible")
@@ -920,6 +1007,43 @@ class CaptchaAndHealthTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         start.assert_called_once()
 
+    def test_extension_cold_start_retries_without_restarting_daemon(self):
+        client = cc.WebBridgeClient(cc.CollectorConfig(delay=3.0))
+        client._send_once = mock.Mock(
+            side_effect=[cc.PageNotReady("no extension connected"), {"ok": True}]
+        )
+        with mock.patch.object(cc, "start_webbridge_daemon") as start:
+            with mock.patch.object(cc.time, "sleep", return_value=None):
+                result = client.send("list_tabs", {})
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(client._send_once.call_count, 2)
+        start.assert_not_called()
+
+    def test_transcript_normalization_and_file_output(self):
+        client = cc.WebBridgeClient(
+            cc.CollectorConfig(platform=cc.PLATFORM_BILIBILI, delay=3.0)
+        )
+        client.eval_js = mock.Mock(
+            return_value={
+                "code": 0,
+                "title": "合成视频",
+                "lan": "ai-zh",
+                "lan_doc": "中文（自动生成）",
+                "lines": [{"from": 65.2, "to": 67.0, "content": "第一句"}],
+            }
+        )
+
+        result = client.fetch_bilibili_transcript("BV1qnuq6dEga")
+        self.assertEqual(result["status"], "ok")
+        with tempfile.TemporaryDirectory() as directory:
+            json_path, txt_path = cc.save_transcript_files(
+                Path(directory) / "BV1qnuq6dEga", "BV1qnuq6dEga", result
+            )
+            document = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual(document["line_count"], 1)
+            self.assertIn("[01:05] 第一句", txt_path.read_text(encoding="utf-8"))
+
     def test_run_navigates_by_default_before_collecting(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "bilibili.json"
@@ -949,6 +1073,7 @@ class CaptchaAndHealthTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, cc.EXIT_OK)
+            bridge.warm_up.assert_called_once_with()
             bridge.prepare_page.assert_called_once_with("BV1qnuq6dEga")
             document = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(document["meta"]["platform"], "bilibili")

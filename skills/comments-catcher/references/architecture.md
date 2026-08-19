@@ -22,7 +22,7 @@ scripts/comments_catcher.py
       v2 JSON / CSV
 ```
 
-采集器首先通过 WebBridge 的 `navigate` 打开目标页面，不要求用户预先打开正确的标签页；只有登录、CAPTCHA 或扩展连接需要人工处理。随后把两个站点的响应规范化为同一组评论字段：`cid`、`text`、`create_time`、`digg_count`、`reply_comment_total`、`nickname` 等。平台特有的视频标识保存在 `meta.platform`、`meta.video_id` 以及 `aweme_id`/`bvid`/`oid` 中。
+采集器首先通过 WebBridge 的 `navigate` 打开目标页面，不要求用户预先打开正确的标签页；只有登录、CAPTCHA 或扩展连接需要人工处理。随后把两个站点的响应规范化为同一组评论字段：`cid`、`text`、`images`、`create_time`、`digg_count`、`reply_comment_total`、`nickname` 等。`images` 保留评论附图的 URL、宽高与多图顺序，文字仍独立保存在 `text`。平台特有的视频标识保存在 `meta.platform`、`meta.video_id` 以及 `aweme_id`/`bvid`/`oid` 中。
 
 ## 平台差异
 

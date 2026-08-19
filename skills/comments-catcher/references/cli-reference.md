@@ -31,6 +31,7 @@ python comments_catcher.py [VIDEO] [OPTIONS]
 | `--output FILE` | 按平台和视频 ID 命名 | JSON 输出路径。建议使用绝对路径。 |
 | `--csv FILE` | 不输出 | 可选 CSV 路径；JSON 仍是完整、可恢复的规范输出。 |
 | `--with-sub` | 关闭 | 采集按 `--sub-rate` 抽样命中的二级回复线程。技能工作流默认添加此参数。 |
+| `--with-transcript` | 关闭 | 仅 B 站：顺带获取视频平台字幕（AI/CC 字幕）文稿，输出 `<视频ID>_transcript.json/.txt`；无字幕标记 `no_subtitle` 跳过；批量模式同样支持，状态记入 `video_list.json`。 |
 | `--subs-only` | 关闭 | 复用已有一级评论结果，只补采二级回复。 |
 | `--sub-rate RATE` | `0.5` | 二级回复线程抽样比例，范围为 `0` 到 `1`。需要 B 站全部回复时显式使用 `1`。缺省读 `config.json`。 |
 | `--seed INTEGER` | `42` | 确定性抽样种子。缺省读 `config.json`。 |
@@ -131,8 +132,10 @@ python ./skills/comments-catcher/scripts/comments_catcher.py \
 
 ## 输出与恢复
 
-输出为 UTF-8 JSON，结构由 `output-schema-v2.json` 定义。`meta` 必须包含 `platform`、`video_id` 以及分页、计数、抽样和完成状态字段；抖音额外保存 `aweme_id`，B 站额外保存 `bvid`，页面可读时保存 `oid`。
+输出为 UTF-8 JSON，结构由 `output-schema-v2.json` 定义。每条评论的文字在 `text`，附图在 `images` 数组；每张图片包含 `url`、`width`、`height`，纯文本评论的 `images` 为空数组。CSV 的 `images` 列使用 JSON 数组字符串保存多图信息。`meta` 必须包含 `platform`、`video_id` 以及分页、计数、抽样和完成状态字段；抖音额外保存 `aweme_id`，B 站额外保存 `bvid`，页面可读时保存 `oid`。
 
 已有同一平台、同一视频的 JSON 会作为断点恢复文件继续使用；不同平台、视频或抽样配置不会被静默覆盖。`main_complete=false` 或 `last_has_more=1` 表示结果不应被描述为全量完成。
+
+启用 `--with-transcript` 时，B 站视频额外产出两个字幕文稿文件（与评论 JSON 同目录、同视频 ID 前缀）：`<视频ID>_transcript.json` 保存标题、字幕语言与带时间轴的 `segments` 数组，`<视频ID>_transcript.txt` 是带 `[mm:ss]` 时间戳的逐句文稿。字幕来自 B 站平台离线生成的字幕轨道（优先 `ai-zh`，其次 UP 主上传的中文字幕），属纯接口数据，获取不需要播放视频；`auth_key` 有时效，采集器在拿到轨道地址后立即下载，不做跨任务复用。无字幕轨道的视频不产出文稿且不算失败。
 
 实现不得提供代理轮换、指纹伪造、签名逆向、Cookie 导入/导出或 CAPTCHA 自动化参数。任何输出和日志都不得包含 Cookie、令牌、认证头或浏览器存储。

@@ -18,7 +18,7 @@
 
 ## WebBridge 不可用
 
-普通采集会由 Agent 自动启动 WebBridge daemon 并导航页面，不要求用户预先打开页面。连接失败时采集器会按官方路径尝试启动一次；如果仍失败，检查 WebBridge 扩展是否安装并连接到浏览器：
+普通采集采用固定预热链路：幂等启动 WebBridge daemon，调用 `list_tabs` 轻量探测并有限等待扩展连接，然后才导航页面；不要求用户预先打开页面。首次出现 `no extension connected` 通常是扩展冷启动窗口，采集器会自动重试，Agent 不应立即打断用户。只有有限重试后仍失败，才检查 WebBridge 扩展是否安装并连接到浏览器：
 
 ```text
 python <skill-root>/scripts/comments_catcher.py <VIDEO> --platform douyin --prepare-page

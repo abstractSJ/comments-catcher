@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-COLLECTOR_VERSION = "0.5.1"
+COLLECTOR_VERSION = "0.7.0"
 SCHEMA_VERSION = "2.0.0"
 PLATFORM_AUTO = "auto"
 PLATFORM_DOUYIN = "douyin"
@@ -39,6 +39,10 @@ SUPPORTED_PLATFORMS = {PLATFORM_DOUYIN, PLATFORM_BILIBILI}
 DOUYIN_HOSTS = {"www.douyin.com", "douyin.com"}
 BILIBILI_HOSTS = {"www.bilibili.com", "bilibili.com", "m.bilibili.com", "space.bilibili.com"}
 DEFAULT_DAEMON_URL = "http://127.0.0.1:10086/command"
+# daemon 可能已监听端口，但浏览器扩展仍在建立连接；首次启动时给扩展一个短暂的
+# 就绪窗口，避免把正常冷启动误报成需要用户排查的永久故障。
+WEBBRIDGE_EXTENSION_READY_ATTEMPTS = 5
+WEBBRIDGE_EXTENSION_READY_DELAY = 1.0
 DEFAULT_SESSIONS = {
     PLATFORM_DOUYIN: "douyin",
     PLATFORM_BILIBILI: "bili-comments",
@@ -243,6 +247,93 @@ class WebBridgeClient:
     })()
     """
 
+    # B 站字幕抓取：aid/cid 优先读页面状态（省一次请求），缺失时回退 view 接口；
+    # 字幕轨道走 x/player/v2，正文是 aisubtitle CDN 上的全量 JSON。
+    # 三次 fetch 在一次 evaluate 内串行完成，fetch 之间留 200ms 间隔，与正常浏览
+    # 打开播放器时的请求节奏一致。
+    # 认证细节：api.bilibili.com 的接口依赖登录 Cookie，必须 credentials:'include'；
+    # 而 aisubtitle CDN 返回 Access-Control-Allow-Origin:*，带凭证会被浏览器 CORS
+    # 拒绝（Failed to fetch），且其 URL 自带 auth_key，所以 CDN 请求不带凭证。
+    # 偏好 ai-zh（平台 AI 字幕），其次任意中文轨道（UP 主上传的 CC 字幕），最后兜底第一条。
+    BILIBILI_TRANSCRIPT_JS = r"""
+    (async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const TIMEOUT = __JS_TIMEOUT_MS__;
+      const guardedGet = (url, withCredentials) => Promise.race([
+        fetch(url, withCredentials ? {credentials: 'include'} : {})
+          .then((r) => r.json())
+          .catch((error) => ({__fetch_error: String(error)})),
+        new Promise((r) => setTimeout(() => r({__timeout: true}), TIMEOUT)),
+      ]);
+      const unwrap = (data, stage) => {
+        if (data.__timeout) return {code: 'js_timeout', error: stage + ' timeout'};
+        if (data.__fetch_error) return {code: 'fetch_error', error: stage + ': ' + data.__fetch_error};
+        return null;
+      };
+      try {
+        let aid = null;
+        let cid = null;
+        let title = '';
+        const state = window.__INITIAL_STATE__ || {};
+        const videoData = state.videoData || {};
+        if (state.aid && videoData.cid) {
+          aid = state.aid;
+          cid = videoData.cid;
+          title = videoData.title || '';
+        }
+        if (!aid || !cid) {
+          const view = await guardedGet(__VIEW_URL__, true);
+          const bad = unwrap(view, 'view');
+          if (bad) return bad;
+          if (Number(view.code) !== 0 || !view.data) {
+            return {code: 'view_failed', error: String(view.message || view.code)};
+          }
+          aid = view.data.aid;
+          cid = view.data.cid;
+          title = view.data.title || title;
+        }
+        await sleep(200);
+        const v2 = await guardedGet(
+          'https://api.bilibili.com/x/player/v2?aid=' + aid + '&cid=' + cid, true
+        );
+        const badV2 = unwrap(v2, 'player/v2');
+        if (badV2) return badV2;
+        if (Number(v2.code) !== 0) {
+          return {code: 'v2_failed', error: String(v2.message || v2.code)};
+        }
+        const tracks = (v2.data && v2.data.subtitle && v2.data.subtitle.subtitles) || [];
+        if (!tracks.length) return {code: 'no_subtitle'};
+        const track = tracks.find((t) => t.lan === 'ai-zh')
+          || tracks.find((t) => String(t.lan || '').indexOf('zh') === 0)
+          || tracks[0];
+        let subUrl = track.subtitle_url || '';
+        if (subUrl.indexOf('//') === 0) subUrl = 'https:' + subUrl;
+        if (!subUrl) return {code: 'no_subtitle'};
+        await sleep(200);
+        const sub = await guardedGet(subUrl, false);
+        const badSub = unwrap(sub, 'subtitle');
+        if (badSub) return badSub;
+        const body = Array.isArray(sub.body) ? sub.body : [];
+        if (!body.length) return {code: 'empty_subtitle'};
+        return {
+          code: 0,
+          aid: aid,
+          cid: cid,
+          title: title,
+          lan: track.lan || '',
+          lan_doc: track.lan_doc || '',
+          lines: body.map((line) => ({
+            from: Number(line.from) || 0,
+            to: Number(line.to) || 0,
+            content: String(line.content == null ? '' : line.content)
+          }))
+        };
+      } catch (error) {
+        return {code: 'exception', error: String(error)};
+      }
+    })()
+    """
+
     CAPTCHA_CHECK_JS = r"""
     (() => {
       const visible = (el) => {
@@ -282,8 +373,33 @@ class WebBridgeClient:
         except json.JSONDecodeError as exc:
             raise DaemonUnavailable("WebBridge 返回了无法解析的响应") from exc
 
+    @staticmethod
+    def _extension_not_connected(exc: PageNotReady) -> bool:
+        """识别 daemon 已启动但浏览器扩展尚未完成握手的短暂状态。"""
+        return "no extension connected" in str(exc).lower()
+
+    def _wait_for_extension(
+        self,
+        request: urllib.request.Request,
+        first_error: PageNotReady,
+    ) -> dict[str, Any]:
+        """在首次冷启动窗口内有限重试，超时后保留明确的人工处理提示。"""
+        last_error = first_error
+        for _ in range(WEBBRIDGE_EXTENSION_READY_ATTEMPTS):
+            time.sleep(WEBBRIDGE_EXTENSION_READY_DELAY)
+            try:
+                return self._send_once(request)
+            except PageNotReady as exc:
+                if not self._extension_not_connected(exc):
+                    raise
+                last_error = exc
+        raise PageNotReady(
+            "WebBridge daemon 已启动，但浏览器扩展仍未连接；"
+            "请启用 Kimi WebBridge 扩展后重试"
+        ) from last_error
+
     def send(self, action: str, args: dict[str, Any]) -> dict[str, Any]:
-        """向本机 daemon 发送命令；连接拒绝时先自动启动一次 daemon。"""
+        """向本机 daemon 发送命令，并容忍扩展首次连接的短暂延迟。"""
         body = json.dumps(
             {"action": action, "args": args, "session": self.config.session},
             ensure_ascii=False,
@@ -295,6 +411,10 @@ class WebBridgeClient:
         )
         try:
             return self._send_once(request)
+        except PageNotReady as exc:
+            if not self._extension_not_connected(exc):
+                raise
+            return self._wait_for_extension(request, exc)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             if self._daemon_start_attempted:
                 raise DaemonUnavailable(f"无法连接 Kimi WebBridge daemon: {exc}") from exc
@@ -308,6 +428,12 @@ class WebBridgeClient:
                 raise DaemonUnavailable(
                     f"无法连接 Kimi WebBridge daemon（已尝试自动启动）：{retry_exc}"
                 ) from retry_exc
+
+    def warm_up(self) -> None:
+        """幂等启动 daemon，并在任何导航前确认浏览器扩展已经连接。"""
+        self._daemon_start_attempted = True
+        start_webbridge_daemon()
+        self.send("list_tabs", {})
 
     def eval_js(self, code: str) -> Any:
         """在当前会话页面内执行 JavaScript，并统一解析 JSON 字符串结果。"""
@@ -592,6 +718,45 @@ class WebBridgeClient:
         result = self.eval_js(self.SIMULATE_BROWSE_JS)
         return result if isinstance(result, dict) else {}
 
+    def fetch_bilibili_transcript(self, video_id: str) -> dict[str, Any]:
+        """
+        尽力获取当前 B 站视频页的平台字幕（AI 字幕或 UP 主上传的 CC 字幕）。
+
+        字幕是平台离线生成的轨道数据，与评论一样是纯接口读取，不需要播放视频。
+        本方法是 best-effort：任何失败都返回 ``{"status": "failed", ...}`` 而不是
+        抛异常，因为字幕只是评论采集的附属产物，不能反过来中断主流程。
+
+        返回：
+            {"status": "ok", "title", "lan", "lan_doc", "lines": [...]}
+            {"status": "no_subtitle"}：该视频没有可用字幕轨道。
+            {"status": "failed", "error": ...}：接口异常或页面不可用。
+        """
+        if video_id.lower().startswith("av"):
+            view_url = f"https://api.bilibili.com/x/web-interface/view?aid={video_id[2:]}"
+        else:
+            view_url = f"https://api.bilibili.com/x/web-interface/view?bvid={video_id}"
+        code = self.BILIBILI_TRANSCRIPT_JS.replace(
+            "__JS_TIMEOUT_MS__", str(self.config.js_timeout_ms)
+        ).replace("__VIEW_URL__", json.dumps(view_url))
+        try:
+            result = self.eval_js(code)
+        except (DaemonUnavailable, PageNotReady) as exc:
+            return {"status": "failed", "error": str(exc)}
+        if not isinstance(result, dict):
+            return {"status": "failed", "error": "字幕接口返回结构异常"}
+        code_value = result.get("code")
+        if code_value == 0:
+            return {
+                "status": "ok",
+                "title": str(result.get("title") or ""),
+                "lan": str(result.get("lan") or ""),
+                "lan_doc": str(result.get("lan_doc") or ""),
+                "lines": result.get("lines") or [],
+            }
+        if code_value in {"no_subtitle", "empty_subtitle"}:
+            return {"status": "no_subtitle"}
+        return {"status": "failed", "error": f"{code_value}: {result.get('error', '')}"}
+
     def fetch_json(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
         """在页面上下文请求一页评论，并返回统一的精简字段。"""
         if self.config.platform == PLATFORM_BILIBILI:
@@ -618,21 +783,56 @@ class WebBridgeClient:
             http_status: wrapped.http_status
           }};
           const includeIdentifiers = {include_identifiers};
-          const comments = (data.comments || []).map((comment) => ({{
-            cid: String(comment.cid),
-            text: comment.text || '',
-            create_time: comment.create_time || 0,
-            digg_count: comment.digg_count || 0,
-            reply_comment_total: comment.reply_comment_total || 0,
-            nickname: (comment.user && comment.user.nickname) || '',
-            uid: includeIdentifiers && comment.user ? String(comment.user.uid || '') : null,
-            ip_label: includeIdentifiers ? (comment.ip_label || null) : null,
-            level: comment.level || 0,
-            is_hot: comment.is_hot || 0,
-            reply_id: comment.reply_id || null,
-            root_comment_id: comment.root_comment_id || null,
-            is_author_digged: comment.is_author_digged || 0
-          }}));
+          const firstHttpUrl = (value) => {{
+            if (!value) return '';
+            if (typeof value === 'string') return /^https?:\\/\\//i.test(value) ? value : '';
+            const candidates = Array.isArray(value.url_list) ? value.url_list : [];
+            const listed = candidates.find(
+              (candidate) => typeof candidate === 'string' && /^https?:\\/\\//i.test(candidate)
+            );
+            if (listed) return listed;
+            return typeof value.url === 'string' && /^https?:\\/\\//i.test(value.url)
+              ? value.url
+              : '';
+          }};
+          const normalizeImage = (image) => {{
+            if (!image || typeof image !== 'object') return null;
+            const url = firstHttpUrl(image.origin_url)
+              || firstHttpUrl(image.large_url)
+              || firstHttpUrl(image.medium_url)
+              || firstHttpUrl(image.download_url)
+              || firstHttpUrl(image.thumbnail_url)
+              || firstHttpUrl(image);
+            if (!url) return null;
+            const width = Number(image.width || 0);
+            const height = Number(image.height || 0);
+            return {{
+              url,
+              width: Number.isFinite(width) && width > 0 ? Math.trunc(width) : null,
+              height: Number.isFinite(height) && height > 0 ? Math.trunc(height) : null
+            }};
+          }};
+          const comments = (data.comments || []).map((comment) => {{
+            const rawImages = Array.isArray(comment.image_list)
+              ? comment.image_list
+              : (Array.isArray(comment.images) ? comment.images : []);
+            return {{
+              cid: String(comment.cid),
+              text: comment.text || '',
+              images: rawImages.map(normalizeImage).filter(Boolean),
+              create_time: comment.create_time || 0,
+              digg_count: comment.digg_count || 0,
+              reply_comment_total: comment.reply_comment_total || 0,
+              nickname: (comment.user && comment.user.nickname) || '',
+              uid: includeIdentifiers && comment.user ? String(comment.user.uid || '') : null,
+              ip_label: includeIdentifiers ? (comment.ip_label || null) : null,
+              level: comment.level || 0,
+              is_hot: comment.is_hot || 0,
+              reply_id: comment.reply_id || null,
+              root_comment_id: comment.root_comment_id || null,
+              is_author_digged: comment.is_author_digged || 0
+            }};
+          }});
           return {{
             code: 0,
             comments,
@@ -723,13 +923,27 @@ class WebBridgeClient:
             http_status: wrapped.http_status
           }};
           const includeIdentifiers = {include_identifiers};
+          const normalizeImage = (picture) => {{
+            if (!picture || typeof picture !== 'object') return null;
+            const url = picture.img_src || picture.img_url || picture.url || '';
+            if (typeof url !== 'string' || !/^https?:\\/\\//i.test(url)) return null;
+            const width = Number(picture.img_width || picture.width || 0);
+            const height = Number(picture.img_height || picture.height || 0);
+            return {{
+              url,
+              width: Number.isFinite(width) && width > 0 ? Math.trunc(width) : null,
+              height: Number.isFinite(height) && height > 0 ? Math.trunc(height) : null
+            }};
+          }};
           const normalizeReply = (reply) => {{
             const member = reply.member || {{}};
             const content = reply.content || {{}};
             const control = reply.reply_control || {{}};
+            const pictures = Array.isArray(content.pictures) ? content.pictures : [];
             return {{
               cid: String(reply.rpid),
               text: content.message || '',
+              images: pictures.map(normalizeImage).filter(Boolean),
               create_time: reply.ctime || 0,
               digg_count: reply.like || 0,
               reply_comment_total: reply.rcount || 0,
@@ -1130,10 +1344,13 @@ def new_state(
 def _normalize_legacy_bilibili_comment(comment: dict[str, Any]) -> dict[str, Any]:
     """把旧 B 站脚本的 replies 字段转换为当前统一评论字段。"""
     if "cid" in comment:
-        return dict(comment)
+        normalized = dict(comment)
+        normalized.setdefault("images", [])
+        return normalized
     return {
         "cid": str(comment.get("rpid", "")),
         "text": str(comment.get("message", "")),
+        "images": [],
         "create_time": comment.get("ctime", 0),
         "digg_count": comment.get("like", 0),
         "reply_comment_total": comment.get("rcount", 0),
@@ -1319,6 +1536,66 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         os.replace(temporary, path)
     except OSError as exc:
         raise CollectionError(f"保存进度失败: {exc}") from exc
+
+
+def _format_timestamp(seconds: float) -> str:
+    """把秒数格式化为 mm:ss（超过一小时为 hh:mm:ss），供文稿时间轴使用。"""
+    total = max(0, int(seconds))
+    if total >= 3600:
+        return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def save_transcript_files(
+    base_path: Path, video_id: str, result: dict[str, Any]
+) -> tuple[Path, Path]:
+    """
+    把 B 站字幕结果落盘为两个文件；沿用评论输出的原子写入方式，避免中断留下半截文件。
+
+    参数：
+        base_path: 不带扩展名的输出前缀；实际产物为 ``<base>_transcript.json/.txt``。
+        video_id: B 站视频 ID（bvid 或 av 号）。
+        result: fetch_bilibili_transcript 的 ok 结果（含 title/lan/lines）。
+    返回：
+        (json_path, txt_path)。
+    """
+    lines = result.get("lines") or []
+    json_path = base_path.with_name(base_path.name + "_transcript.json")
+    txt_path = base_path.with_name(base_path.name + "_transcript.txt")
+    document = {
+        "platform": PLATFORM_BILIBILI,
+        "video_id": video_id,
+        "title": result.get("title") or "",
+        "lan": result.get("lan") or "",
+        "lan_doc": result.get("lan_doc") or "",
+        "line_count": len(lines),
+        "source": "bilibili_subtitle",
+        "fetched_at": utc_now_iso(),
+        "segments": lines,
+    }
+    header = [
+        f"# {document['title'] or video_id}",
+        f"# 字幕：{document['lan_doc'] or document['lan'] or '未知'} · {len(lines)} 句 · 来源 B 站平台字幕",
+        "",
+    ]
+    body = [
+        f"[{_format_timestamp(line.get('from', 0))}] {line.get('content', '')}"
+        for line in lines
+    ]
+    validate_output_path(json_path)
+    validate_output_path(txt_path)
+    try:
+        tmp_json = json_path.with_name(json_path.name + ".tmp")
+        tmp_json.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp_json, json_path)
+        tmp_txt = txt_path.with_name(txt_path.name + ".tmp")
+        tmp_txt.write_text("\n".join(header + body) + "\n", encoding="utf-8")
+        os.replace(tmp_txt, txt_path)
+    except OSError as exc:
+        raise CollectionError(f"保存字幕文稿失败: {exc}") from exc
+    return json_path, txt_path
 
 
 def new_space_manifest(platform: str, user_id: str, space_url: str) -> dict[str, Any]:
@@ -1604,6 +1881,7 @@ def export_csv(path: Path, state: dict[str, Any]) -> None:
         "root_cid",
         "is_sub",
         "text",
+        "images",
         "digg_count",
         "create_time",
         "reply_comment_total",
@@ -1644,7 +1922,12 @@ def export_csv(path: Path, state: dict[str, Any]) -> None:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for row in rows:
-                writer.writerow({key: row.get(key, "") for key in fieldnames})
+                payload = {key: row.get(key, "") for key in fieldnames}
+                # CSV 没有数组类型，使用 JSON 字符串保留多图顺序并避免 URL 分隔歧义。
+                payload["images"] = json.dumps(
+                    row.get("images") or [], ensure_ascii=False, separators=(",", ":")
+                )
+                writer.writerow(payload)
     except OSError as exc:
         raise CollectionError(f"写入 CSV 失败: {exc}") from exc
     print(f"[CSV] {path}，共 {len(rows)} 行")
@@ -1660,6 +1943,10 @@ def run_space_batch(args: argparse.Namespace, config: CollectorConfig, bridge: W
     失效，中止整个任务等待人工检查。
     """
     platform = config.platform
+    # 字幕是 B 站专属能力；抖音没有同类开放字幕轨道，给出提示后按未开启处理。
+    with_transcript = bool(args.with_transcript and platform == PLATFORM_BILIBILI)
+    if args.with_transcript and platform != PLATFORM_BILIBILI:
+        print("[提示] --with-transcript 目前仅支持 B 站，抖音视频将跳过字幕获取", flush=True)
     user_id, space_url = extract_space_target(args.space, platform)
     output_dir = Path(
         args.output_dir or f"space-comments-{user_id}"
@@ -1674,9 +1961,35 @@ def run_space_batch(args: argparse.Namespace, config: CollectorConfig, bridge: W
         f"[运行参数] 基础间隔={config.delay:.1f}s，视频间隔={config.video_delay:.1f}s，"
         f"页面停留={config.dwell:.1f}s，抖动幅度={config.jitter_range:.2f}"
         f"（±{config.jitter_range / 2:.0%}），抽样率={args.sub_rate:.2f}，"
-        f"种子={args.seed}{source_note}",
+        f"种子={args.seed}，字幕文稿={'开' if with_transcript else '关'}{source_note}",
         flush=True,
     )
+
+    def collect_transcript(entry: dict[str, Any], video_id: str, need_navigate: bool) -> None:
+        """
+        单视频字幕采集（best-effort）。
+
+        字幕只是评论的附属产物：任何失败都只写入 ``entry["transcript"] = "failed"``
+        并打印警告，绝不向上抛错，避免字幕接口波动把评论主流程拖入失败重试。
+        ``no_subtitle`` 是终态（该视频没有字幕轨道），``failed`` 允许下次运行重试。
+        """
+        try:
+            if need_navigate:
+                bridge.prepare_page(video_id)
+            result = bridge.fetch_bilibili_transcript(video_id)
+            if result["status"] == "ok":
+                json_path, _ = save_transcript_files(output_dir / video_id, video_id, result)
+                entry["transcript"] = "done"
+                print(f"  [字幕] {len(result['lines'])} 句 -> {json_path.name}")
+            elif result["status"] == "no_subtitle":
+                entry["transcript"] = "no_subtitle"
+                print("  [字幕] 该视频无平台字幕，跳过")
+            else:
+                entry["transcript"] = "failed"
+                print(f"  [字幕警告] {result.get('error')}；不影响评论结果")
+        except (CollectionError, PageNotReady, DaemonUnavailable) as exc:
+            entry["transcript"] = "failed"
+            print(f"  [字幕警告] 获取失败：{exc}；不影响评论结果")
 
     print(f"[主页] 打开 {space_url}", flush=True)
     bridge.prepare_space_page(space_url)
@@ -1712,7 +2025,17 @@ def run_space_batch(args: argparse.Namespace, config: CollectorConfig, bridge: W
     consecutive_failures = 0
     for index, entry in enumerate(videos, 1):
         if entry.get("status") == "done":
-            print(f"[批量] {index}/{total} {entry['video_id']} 已完成，跳过")
+            # 评论已完成的视频仍允许补采字幕（例如历史任务重跑时才加 --with-transcript）；
+            # no_subtitle 是终态不重试，failed 下次运行再试。
+            if with_transcript and entry.get("transcript") not in {"done", "no_subtitle"}:
+                video_id = str(entry["video_id"])
+                print(f"[批量] {index}/{total} {video_id} 评论已完成，仅补采字幕", flush=True)
+                collect_transcript(entry, video_id, need_navigate=True)
+                save_space_manifest(manifest_path, manifest)
+                if any(v.get("status") != "done" or v.get("transcript") not in {"done", "no_subtitle"} for v in videos[index:]):
+                    rate_sleep(config)
+            else:
+                print(f"[批量] {index}/{total} {entry['video_id']} 已完成，跳过")
             continue
         video_id = str(entry["video_id"])
         print(f"[批量] {index}/{total} 视频 {video_id}（{entry.get('title') or '无标题'}）", flush=True)
@@ -1755,6 +2078,9 @@ def run_space_batch(args: argparse.Namespace, config: CollectorConfig, bridge: W
                 }
             )
             consecutive_failures = 0
+            # 评论落盘后顺势抓字幕：页面还停在当前视频，不需要额外导航。
+            if with_transcript:
+                collect_transcript(entry, video_id, need_navigate=False)
             print(
                 f"  [批量进度] {video_id} 完成：一级 {summary['fetched_count']} 条 "
                 f"+ 二级 {summary['sub_count']} 条"
@@ -1780,7 +2106,12 @@ def run_space_batch(args: argparse.Namespace, config: CollectorConfig, bridge: W
 
     done = sum(1 for v in videos if v.get("status") == "done")
     failed = sum(1 for v in videos if v.get("status") == "failed")
-    print(f"[批量完成] 成功 {done}/{total}，失败 {failed}；清单 {manifest_path}")
+    transcript_note = ""
+    if with_transcript:
+        sub_done = sum(1 for v in videos if v.get("transcript") == "done")
+        sub_none = sum(1 for v in videos if v.get("transcript") == "no_subtitle")
+        transcript_note = f"；字幕 {sub_done} 个已存、{sub_none} 个无字幕"
+    print(f"[批量完成] 成功 {done}/{total}，失败 {failed}{transcript_note}；清单 {manifest_path}")
     return EXIT_OK
 
 
@@ -1813,6 +2144,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", help="JSON 输出路径；默认按视频 ID 命名")
     parser.add_argument("--csv", help="可选 CSV 输出路径")
     parser.add_argument("--with-sub", action="store_true", help="采集抽样命中的二级回复线程")
+    parser.add_argument(
+        "--with-transcript",
+        action="store_true",
+        help="B 站视频顺带获取平台字幕文稿（AI/CC 字幕），输出 <视频ID>_transcript.json/.txt；"
+        "无字幕时标记跳过；仅 B 站可用",
+    )
     parser.add_argument("--subs-only", action="store_true", help="复用已有一级评论，只补采二级回复")
     parser.add_argument(
         "--sub-rate",
@@ -1968,6 +2305,9 @@ def run(argv: list[str] | None = None) -> int:
     """命令行主流程，返回稳定退出码供 Skill/Agent 判断下一步。"""
     args, config = parse_and_validate_args(argv)
     bridge = WebBridgeClient(config)
+    # 首次请求直接导航时容易撞上扩展冷启动窗口；先做无页面副作用的轻量探测，
+    # 让单视频、批量和健康检查共用同一条稳定启动链路。
+    bridge.warm_up()
 
     if args.health_check:
         result, code = bridge.health_check()
@@ -2040,6 +2380,21 @@ def run(argv: list[str] | None = None) -> int:
     if args.with_sub:
         collector.fetch_subs()
     save_state(output_path, state)
+
+    # 字幕是评论的附属产物（best-effort）：失败只告警，不影响已完成的评论结果。
+    if args.with_transcript:
+        if platform == PLATFORM_BILIBILI:
+            result = bridge.fetch_bilibili_transcript(video_id)
+            if result["status"] == "ok":
+                base = output_path.with_suffix("")
+                json_path, _ = save_transcript_files(base, video_id, result)
+                print(f"[字幕] {len(result['lines'])} 句 -> {json_path}")
+            elif result["status"] == "no_subtitle":
+                print("[字幕] 该视频无平台字幕，跳过")
+            else:
+                print(f"[字幕警告] {result.get('error')}；不影响评论结果")
+        else:
+            print("[提示] --with-transcript 目前仅支持 B 站，抖音视频将跳过字幕获取")
 
     if args.csv:
         export_csv(Path(args.csv).expanduser().resolve(), state)

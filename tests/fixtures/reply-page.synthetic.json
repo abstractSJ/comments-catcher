@@ -3,7 +3,14 @@
   "comments": [
     {
       "cid": "7100000000000000001",
-      "text": "合成二级评论 A",
+      "text": "",
+      "images": [
+        {
+          "url": "https://example.invalid/reply-a.webp",
+          "width": null,
+          "height": null
+        }
+      ],
       "create_time": 1700000101,
       "digg_count": 0,
       "reply_comment_total": 0,
@@ -19,6 +26,7 @@
     {
       "cid": "7100000000000000002",
       "text": "合成二级评论 B",
+      "images": [],
       "create_time": 1700000102,
       "digg_count": 1,
       "reply_comment_total": 0,

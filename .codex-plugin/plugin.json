@@ -1,7 +1,7 @@
 {
   "name": "comments-catcher",
-  "version": "0.5.1",
-  "description": "Collect public Douyin or Bilibili comments through an existing authenticated WebBridge browser session.",
+  "version": "0.7.0",
+  "description": "Collect public Douyin or Bilibili comments, comment images, and optional Bilibili transcripts through WebBridge.",
   "author": {
     "name": "comments-catcher"
   },
@@ -13,5 +13,14 @@
     "webbridge",
     "data-export"
   ],
+  "interface": {
+    "displayName": "Comments Catcher",
+    "shortDescription": "Collect Douyin and Bilibili comments with images",
+    "longDescription": "Collect public Douyin or Bilibili comments and comment images through WebBridge, with optional Bilibili transcript export.",
+    "developerName": "comments-catcher",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": "Use $comments-catcher to collect this video's public comments and images into validated JSON."
+  },
   "skills": "./skills/"
 }

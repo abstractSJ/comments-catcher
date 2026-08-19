@@ -15,7 +15,7 @@
 ## 前置条件
 
 - Python 3.10 或更高版本。
-- 已安装并可由 Agent 使用的 Kimi WebBridge 扩展/daemon；采集器会在连接被拒绝时按官方路径尝试启动 daemon。
+- 已安装并可由 Agent 使用的 Kimi WebBridge 扩展/daemon；采集器会在每次任务开始时幂等启动 daemon，并在导航前等待扩展完成连接。
 - 对应平台的浏览器登录状态可用；Agent 会自动打开目标抖音或 B 站视频，只有登录失效时才需要用户手动登录。
 - 输出目录具有写权限。
 
@@ -77,7 +77,7 @@ comments-catcher/
 python <installed-skill-root>/scripts/smoke_validate.py
 ```
 
-正常采集时不需要用户预先打开页面；直接传入视频 URL/ID，采集器会自动导航。需要单独预检时运行：
+正常采集时不需要用户预先打开页面；直接传入视频 URL/ID。采集器会先启动 daemon、用 `list_tabs` 轻量探测等待扩展连接，再自动导航。首次收到 `no extension connected` 会在内部有限重试，不应立即要求用户排查。需要单独预检时运行：
 
 ```text
 python <installed-skill-root>/scripts/comments_catcher.py <VIDEO> --platform douyin --prepare-page
