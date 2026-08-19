@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "comments-catcher",
   "owner": {
-    "name": "CURRENT_GITHUB_OWNER"
+    "name": "abstractSJ"
   },
   "metadata": {
     "description": "Official marketplace manifest for the comments-catcher Claude Code plugin.",
@@ -14,7 +14,7 @@
       "source": "./",
       "description": "Collect public Douyin or Bilibili comments, comment images, and optional Bilibili transcripts through WebBridge.",
       "version": "0.7.0",
-      "repository": "https://github.com/CURRENT_GITHUB_OWNER/comments-catcher",
+      "repository": "https://github.com/abstractSJ/comments-catcher",
       "license": "MIT",
       "keywords": [
         "comments",
